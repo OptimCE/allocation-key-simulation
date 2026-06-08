@@ -85,9 +85,7 @@ async def create_crm_key(
     return key
 
 
-async def create_simulation_with_result(
-    session, *, id_community: int, **kwargs
-) -> SimulationModel:
+async def create_simulation_with_result(session, *, id_community: int, **kwargs) -> SimulationModel:
     """Create a SUCCESS simulation with a full scalar result tree."""
     result_storage_key = kwargs.pop("result_storage_key", "simulations/1/result.json")
     sim = await create_simulation(

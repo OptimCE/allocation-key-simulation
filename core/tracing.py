@@ -28,9 +28,7 @@ def setup_tracer_provider() -> None:
     if settings.ENV == Environment.LOCAL:
         return
 
-    resource = Resource.create(
-        {"service.name": "simulation-key-backend", "env": settings.ENV}
-    )
+    resource = Resource.create({"service.name": "simulation-key-backend", "env": settings.ENV})
     headers = {"Authorization": f"Bearer {settings.LOGGING_TOKEN}"}
 
     # --- Logs ---

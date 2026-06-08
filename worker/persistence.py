@@ -155,9 +155,7 @@ async def save_success(simulation_id: int, result: KeySimResult) -> None:
             )
         )
         if claim.rowcount == 0:
-            logger.info(
-                "save_success no-op for simulation %d (already non-PENDING)", simulation_id
-            )
+            logger.info("save_success no-op for simulation %d (already non-PENDING)", simulation_id)
             return
 
         session.add(_build_key_result(result, simulation_id, community_id))
@@ -204,9 +202,7 @@ async def save_failure(simulation_id: int, error_message: str) -> None:
             )
         )
         if claim.rowcount == 0:
-            logger.info(
-                "save_failure no-op for simulation %d (already non-PENDING)", simulation_id
-            )
+            logger.info("save_failure no-op for simulation %d (already non-PENDING)", simulation_id)
             return
 
         await session.commit()

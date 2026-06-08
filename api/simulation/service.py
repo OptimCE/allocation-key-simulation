@@ -61,9 +61,7 @@ class SimulationService:
         try:
             content = await storage.download(sim.result_storage_key)
         except storage.ObjectNotFound as exc:
-            raise ErrorException(
-                error=errors.simulation.RESULT_NOT_FOUND, status_code=404
-            ) from exc
+            raise ErrorException(error=errors.simulation.RESULT_NOT_FOUND, status_code=404) from exc
         return SimulationTimeseries.model_validate_json(content)
 
     async def start_simulation(
@@ -147,9 +145,7 @@ class SimulationService:
             )
             await self._mark_failed_to_queue(simulation_id, str(exc))
             await _best_effort_delete(storage_key)
-            raise ErrorException(
-                error=errors.simulation.START_SIMULATION, status_code=500
-            ) from exc
+            raise ErrorException(error=errors.simulation.START_SIMULATION, status_code=500) from exc
 
         return SimulateResponse(id=simulation_id, status=SimulationStatus.PENDING)
 

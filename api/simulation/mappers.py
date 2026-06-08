@@ -78,7 +78,5 @@ def to_simulation_detail(simulation: SimulationModel) -> SimulationDetail:
         key_name=simulation.key_name,
         error_message=simulation.error_message,
         has_timeseries=simulation.result_storage_key is not None,
-        key_result=(
-            to_key_result_schema(simulation.key_result) if simulation.key_result else None
-        ),
+        key_result=(to_key_result_schema(simulation.key_result) if simulation.key_result else None),
     )

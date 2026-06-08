@@ -9,9 +9,7 @@ class CRMRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def get_allocation_key(
-        self, id_key: int, id_community: int
-    ) -> AllocationKeyModel | None:
+    async def get_allocation_key(self, id_key: int, id_community: int) -> AllocationKeyModel | None:
         """Load a CRM allocation key with its iteration/consumer subtree.
 
         Scoped to ``id_community`` explicitly (rather than via
@@ -26,9 +24,7 @@ class CRMRepository:
         stmt = (
             select(AllocationKeyModel)
             .options(
-                selectinload(AllocationKeyModel.iterations).selectinload(
-                    IterationModel.consumers
-                )
+                selectinload(AllocationKeyModel.iterations).selectinload(IterationModel.consumers)
             )
             .where(AllocationKeyModel.id == id_key)
             .where(AllocationKeyModel.id_community == id_community)

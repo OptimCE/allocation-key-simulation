@@ -38,7 +38,8 @@ class SimulationInputError(ValueError):
 
 def _relu(x: np.ndarray) -> np.ndarray:
     """``max(0, x)`` element-wise, via the legacy ``(x + |x|) / 2`` form."""
-    return (x + np.abs(x)) / 2.0
+    result: np.ndarray = (x + np.abs(x)) / 2.0
+    return result
 
 
 def _safe_divide(num: np.ndarray, den: np.ndarray) -> np.ndarray:
@@ -46,7 +47,8 @@ def _safe_divide(num: np.ndarray, den: np.ndarray) -> np.ndarray:
     num = np.asarray(num, dtype=np.float64)
     den = np.asarray(den, dtype=np.float64)
     out = np.zeros(np.broadcast_shapes(num.shape, den.shape), dtype=np.float64)
-    return np.divide(num, den, out=out, where=den != 0)
+    np.divide(num, den, out=out, where=den != 0)
+    return out
 
 
 def run_simulation(
@@ -105,6 +107,7 @@ def run_simulation(
             va_series = production * it.energy_allocated_percentage
             consumption_matrix = C
         else:
+            assert prev_residual_matrix is not None
             va_series = production * it.energy_allocated_percentage + prev_surplus_series
             consumption_matrix = prev_residual_matrix
 
@@ -193,9 +196,7 @@ def run_simulation(
     #   residual (unmet demand) are taken from the last iteration.
     first = iteration_results[0]
     last = iteration_results[-1]
-    consumed_total_all = float(
-        sum(it.energy_allocated_consumed_total for it in iteration_results)
-    )
+    consumed_total_all = float(sum(it.energy_allocated_consumed_total for it in iteration_results))
     consumption_total_key = first.consumption_total
     energy_allocated_total_key = first.energy_allocated_total
     self_sufficiency_total_key = (

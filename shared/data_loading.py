@@ -76,9 +76,7 @@ def to_simulation_raw_data(
     dataframe = dataframe.rename(columns=str)
 
     if injection_name not in dataframe.columns:
-        raise InvalidInjectionColumnError(
-            f"Injection column {injection_name!r} not found in file"
-        )
+        raise InvalidInjectionColumnError(f"Injection column {injection_name!r} not found in file")
 
     missing = [name for name in consumer_names if name not in dataframe.columns]
     if missing:

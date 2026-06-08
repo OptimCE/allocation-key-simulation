@@ -68,8 +68,7 @@ def _queue_depth_callback(
 ) -> Iterable[Observation]:
     """Emit one observation per subject with its current pending count."""
     return [
-        Observation(value, {"subject": subject})
-        for subject, value in queue_depth_snapshot.items()
+        Observation(value, {"subject": subject}) for subject, value in queue_depth_snapshot.items()
     ]
 
 

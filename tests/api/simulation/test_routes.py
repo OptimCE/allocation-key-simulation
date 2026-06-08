@@ -203,9 +203,7 @@ async def test_start_simulation_storage_failure_returns_502(mock_upload, client,
     assert rows == []
 
 
-@patch(
-    "api.simulation.service.SimulationService._mark_failed_to_queue", new_callable=AsyncMock
-)
+@patch("api.simulation.service.SimulationService._mark_failed_to_queue", new_callable=AsyncMock)
 @patch("api.simulation.service.storage.delete", new_callable=AsyncMock)
 @patch("api.simulation.service.storage.upload", new_callable=AsyncMock)
 @patch("api.simulation.service.get_jetstream", return_value=MagicMock())

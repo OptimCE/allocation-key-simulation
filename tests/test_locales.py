@@ -31,8 +31,8 @@ def test_supported_locales_includes_fr_en_de_nl():
 @pytest.mark.parametrize("key", _ALL_KEYS)
 def test_translate_returns_localized_string_for_every_supported_locale(locale: str, key: str):
     translated = translate(key, locale)
-    assert translated != key, (
-        f"Key {key!r} is missing in locale {locale!r} (translate returned the bare key)"
-    )
+    assert (
+        translated != key
+    ), f"Key {key!r} is missing in locale {locale!r} (translate returned the bare key)"
     assert isinstance(translated, str)
     assert translated.strip(), f"Empty translation for {key!r} in {locale!r}"
