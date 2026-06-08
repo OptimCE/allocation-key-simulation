@@ -103,11 +103,10 @@ def run_simulation(
 
         # Production available to this iteration: a fraction of the injection
         # plus (for iteration > 0) the surplus carried forward from the previous.
-        if prev_surplus_series is None:
+        if prev_surplus_series is None or prev_residual_matrix is None:
             va_series = production * it.energy_allocated_percentage
             consumption_matrix = C
         else:
-            assert prev_residual_matrix is not None
             va_series = production * it.energy_allocated_percentage + prev_surplus_series
             consumption_matrix = prev_residual_matrix
 
