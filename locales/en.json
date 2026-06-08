@@ -1,0 +1,25 @@
+{
+  "ERRORS": {
+    "AUTH": {
+      "UNAUTHORIZED": "Authentication required (code: 1)",
+      "FORBIDDEN": "Access denied (code: 2)",
+      "RATE_LIMITED": "Too many requests, please try again later (code: 3)",
+      "AUTHORIZATION_MISSING": "Missing authorization header (code: 4)"
+    },
+    "SUBSCRIPTION": {
+      "NOT_SUBSCRIBED": "You are not subscribed to this service (code: 1003)"
+    },
+    "SIMULATION": {
+      "GET_SIMULATIONS": "Failed to retrieve simulations (code: 2100)",
+      "GET_SIMULATION": "Failed to retrieve the simulation (code: 2101)",
+      "SIMULATION_NOT_FOUND": "Simulation not found (code: 2102)",
+      "KEY_NOT_FOUND": "Allocation key not found (code: 2103)",
+      "INVALID_FILE": "Invalid or empty file (code: 2104)",
+      "STORAGE_UPLOAD_FAILED": "Failed to upload the file to storage (code: 2105)",
+      "START_SIMULATION": "Failed to start the simulation (code: 2106)",
+      "DELETE_SIMULATION": "Failed to delete the simulation (code: 2107)",
+      "RESULT_NOT_FOUND": "Simulation results not found (code: 2108)",
+      "GET_TIMESERIES": "Failed to retrieve the simulation time series (code: 2109)"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "ERRORS": {
+    "AUTH": {
+      "UNAUTHORIZED": "Authenticatie vereist (code: 1)",
+      "FORBIDDEN": "Toegang geweigerd (code: 2)",
+      "RATE_LIMITED": "Te veel verzoeken, probeer het later opnieuw (code: 3)",
+      "AUTHORIZATION_MISSING": "Autorisatie-header ontbreekt (code: 4)"
+    },
+    "SUBSCRIPTION": {
+      "NOT_SUBSCRIBED": "U bent niet geabonneerd op deze dienst (code: 1003)"
+    },
+    "SIMULATION": {
+      "GET_SIMULATIONS": "Ophalen van simulaties mislukt (code: 2100)",
+      "GET_SIMULATION": "Ophalen van de simulatie mislukt (code: 2101)",
+      "SIMULATION_NOT_FOUND": "Simulatie niet gevonden (code: 2102)",
+      "KEY_NOT_FOUND": "Verdeelsleutel niet gevonden (code: 2103)",
+      "INVALID_FILE": "Ongeldig of leeg bestand (code: 2104)",
+      "STORAGE_UPLOAD_FAILED": "Uploaden van het bestand naar de opslag mislukt (code: 2105)",
+      "START_SIMULATION": "Starten van de simulatie mislukt (code: 2106)",
+      "DELETE_SIMULATION": "Verwijderen van de simulatie mislukt (code: 2107)",
+      "RESULT_NOT_FOUND": "Simulatieresultaten niet gevonden (code: 2108)",
+      "GET_TIMESERIES": "Ophalen van de tijdreeksen van de simulatie mislukt (code: 2109)"
+    }
+  }
+}

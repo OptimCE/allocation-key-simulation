@@ -1,0 +1,8 @@
+[
+  {
+    "name": "SIMULATIONS",
+    "subjects": ["optimce.simulation.>"],
+    "retention": "work_queue",
+    "storage": "file"
+  }
+]

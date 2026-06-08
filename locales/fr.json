@@ -1,0 +1,25 @@
+{
+  "ERRORS": {
+    "AUTH": {
+      "UNAUTHORIZED": "Authentification requise (code: 1)",
+      "FORBIDDEN": "Accès refusé (code: 2)",
+      "RATE_LIMITED": "Trop de requêtes, veuillez réessayer plus tard (code: 3)",
+      "AUTHORIZATION_MISSING": "En-tête d'autorisation manquant (code: 4)"
+    },
+    "SUBSCRIPTION": {
+      "NOT_SUBSCRIBED": "Vous n'êtes pas abonné à ce service (code: 1003)"
+    },
+    "SIMULATION": {
+      "GET_SIMULATIONS": "Échec de la récupération des simulations (code: 2100)",
+      "GET_SIMULATION": "Échec de la récupération de la simulation (code: 2101)",
+      "SIMULATION_NOT_FOUND": "Simulation introuvable (code: 2102)",
+      "KEY_NOT_FOUND": "Clé de répartition introuvable (code: 2103)",
+      "INVALID_FILE": "Fichier invalide ou vide (code: 2104)",
+      "STORAGE_UPLOAD_FAILED": "Échec de l'envoi du fichier vers le stockage (code: 2105)",
+      "START_SIMULATION": "Échec du démarrage de la simulation (code: 2106)",
+      "DELETE_SIMULATION": "Échec de la suppression de la simulation (code: 2107)",
+      "RESULT_NOT_FOUND": "Résultats de simulation introuvables (code: 2108)",
+      "GET_TIMESERIES": "Échec de la récupération des séries temporelles de la simulation (code: 2109)"
+    }
+  }
+}

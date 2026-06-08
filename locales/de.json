@@ -1,0 +1,25 @@
+{
+  "ERRORS": {
+    "AUTH": {
+      "UNAUTHORIZED": "Authentifizierung erforderlich (Code: 1)",
+      "FORBIDDEN": "Zugriff verweigert (Code: 2)",
+      "RATE_LIMITED": "Zu viele Anfragen, bitte später erneut versuchen (Code: 3)",
+      "AUTHORIZATION_MISSING": "Autorisierungs-Header fehlt (Code: 4)"
+    },
+    "SUBSCRIPTION": {
+      "NOT_SUBSCRIBED": "Sie sind nicht für diesen Dienst angemeldet (Code: 1003)"
+    },
+    "SIMULATION": {
+      "GET_SIMULATIONS": "Simulationen konnten nicht abgerufen werden (Code: 2100)",
+      "GET_SIMULATION": "Die Simulation konnte nicht abgerufen werden (Code: 2101)",
+      "SIMULATION_NOT_FOUND": "Simulation nicht gefunden (Code: 2102)",
+      "KEY_NOT_FOUND": "Aufteilungsschlüssel nicht gefunden (Code: 2103)",
+      "INVALID_FILE": "Ungültige oder leere Datei (Code: 2104)",
+      "STORAGE_UPLOAD_FAILED": "Datei konnte nicht in den Speicher hochgeladen werden (Code: 2105)",
+      "START_SIMULATION": "Die Simulation konnte nicht gestartet werden (Code: 2106)",
+      "DELETE_SIMULATION": "Die Simulation konnte nicht gelöscht werden (Code: 2107)",
+      "RESULT_NOT_FOUND": "Simulationsergebnisse nicht gefunden (Code: 2108)",
+      "GET_TIMESERIES": "Zeitreihen der Simulation konnten nicht abgerufen werden (Code: 2109)"
+    }
+  }
+}
