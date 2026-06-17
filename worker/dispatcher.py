@@ -22,10 +22,12 @@ FAILURE), never on transient NAKs (the next delivery still needs the file).
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from concurrent.futures import BrokenExecutor, Executor
 
 from nats.aio.msg import Msg
 from nats.js import JetStreamContext
@@ -40,15 +42,19 @@ from shared.const import SIMULATION_SUBJECT, SimulationStatus
 from shared.crm_repository import CRMRepository
 from shared.models.local_models import SimulationModel
 from simulation.compute import SimulationInputError, run_simulation
+from simulation.inputs import SimulationKeyInput
 from simulation.key_mapping import consumer_names_of, from_crm_allocation_key
+from simulation.result import KeySimResult
 from worker import persistence
 
 logger = logging.getLogger(__name__)
 
-# Simulation is fast (vectorised numpy); a couple of minutes covers parsing a
-# year of 15-min data plus the compute. JetStream will not redeliver until
-# ack_wait elapses, so this also caps how long a silent crash stalls the queue.
-_ACK_WAIT_SECONDS = 2 * 60
+# The solve runs off-loop in a process pool and several solves share the
+# available cores, so an individual solve's wall-clock can stretch under load.
+# 10 minutes gives generous headroom against redelivering a still-running solve.
+# JetStream will not redeliver until ack_wait elapses, so this also caps how
+# long a silent crash stalls the queue.
+_ACK_WAIT_SECONDS = 10 * 60
 
 # How long JetStream waits before redelivering after a NAK.
 _NAK_RETRY_DELAY_SECONDS = 30
@@ -84,70 +90,177 @@ class _TransientError(Exception):
     """
 
 
-async def subscribe(js: JetStreamContext):
-    """Subscribe the worker to the simulation subject. Returns the subscription."""
+async def subscribe(
+    js: JetStreamContext,
+    *,
+    executor: Executor | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+    inflight: set[asyncio.Task] | None = None,
+    max_ack_pending: int | None = None,
+):
+    """Subscribe the worker to the simulation subject. Returns the subscription.
+
+    ``executor`` / ``semaphore`` / ``inflight`` enable the off-loop solver pool:
+    when set, the callback spawns each solve as a tracked background task
+    (bounded by the semaphore) and returns, so the listener never blocks. Left
+    unset, the callback handles each message inline to completion — the
+    single-process fallback the handler unit tests rely on.
+
+    ``max_ack_pending`` caps how many messages JetStream delivers before we ack,
+    so the broker never hands us more than the pool can actively solve.
+    """
+    config_kwargs: dict = {"ack_wait": _ACK_WAIT_SECONDS}
+    if max_ack_pending is not None:
+        config_kwargs["max_ack_pending"] = max_ack_pending
     sub = await js.subscribe(
         subject=SIMULATION_SUBJECT,
         durable=_DURABLE,
         queue=_DURABLE,
         manual_ack=True,
-        cb=_make_handler(),
-        config=ConsumerConfig(ack_wait=_ACK_WAIT_SECONDS),
+        cb=_make_handler(executor=executor, semaphore=semaphore, inflight=inflight),
+        config=ConsumerConfig(**config_kwargs),
     )
     logger.info("Subscribed to %s (durable=%s)", SIMULATION_SUBJECT, _DURABLE)
     return sub
 
 
-def _make_handler() -> Callable[[Msg], Awaitable[None]]:
+def _make_handler(
+    *,
+    executor: Executor | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+    inflight: set[asyncio.Task] | None = None,
+) -> Callable[[Msg], Awaitable[None]]:
+    """Build the per-message callback.
+
+    nats-py serialises a subscription's callback — it ``await``\\ s one message
+    before pulling the next. So to solve several messages concurrently we spawn
+    the work as a background task and return immediately, letting the next
+    message be delivered while this one solves. ``inflight`` tracks those tasks
+    for graceful drain on shutdown.
+
+    When ``inflight`` is None the message is handled inline to completion — the
+    shape the handler unit tests rely on, and a safe single-process fallback.
+    """
+
+    def _on_task_done(task: asyncio.Task) -> None:
+        if inflight is not None:
+            inflight.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Simulation handler task crashed: %r", task.exception())
+
     async def handle(msg: Msg) -> None:
-        try:
-            event = Event.decode(msg.data)
-        except Exception:
-            logger.exception(
-                "Failed to decode event on %s; acking and dropping", SIMULATION_SUBJECT
-            )
-            await msg.ack()
-            app_metrics.worker_messages.add(1, {"outcome": "drop_decode"})
+        if inflight is None:
+            await _handle_message(msg, executor=executor, semaphore=semaphore)
             return
-
-        simulation_id = event.data.get("simulation_id") if isinstance(event.data, dict) else None
-        if not isinstance(simulation_id, int):
-            logger.error(
-                "Event on %s has missing/invalid simulation_id: %r",
-                SIMULATION_SUBJECT,
-                event.data,
-            )
-            await msg.ack()
-            app_metrics.worker_messages.add(1, {"outcome": "drop_invalid_id"})
-            return
-
-        try:
-            outcome = await _process(simulation_id, msg)
-        except _TransientError as exc:
-            logger.warning(
-                "Transient failure for simulation %d, will redeliver: %s", simulation_id, exc
-            )
-            await msg.nak(delay=_NAK_RETRY_DELAY_SECONDS)
-            app_metrics.worker_messages.add(1, {"outcome": "nak"})
-            return
-        except Exception:
-            # Catch-all so the subscription never dies. Treat as deterministic:
-            # mark FAILED rather than redeliver indefinitely.
-            logger.exception("Unhandled error processing simulation %d", simulation_id)
-            await persistence.save_failure(simulation_id, "unhandled_worker_error")
-            await msg.ack()
-            app_metrics.worker_messages.add(1, {"outcome": "ack_unhandled"})
-            return
-
-        await msg.ack()
-        if outcome.storage_key is not None:
-            await _delete_safely(outcome.storage_key)
-        app_metrics.worker_messages.add(1, {"outcome": "ack"})
+        task = asyncio.create_task(_handle_message(msg, executor=executor, semaphore=semaphore))
+        inflight.add(task)
+        task.add_done_callback(_on_task_done)
 
     return handle
 
 
-async def _process(simulation_id: int, msg: Msg) -> _Terminal:
+async def _handle_message(
+    msg: Msg,
+    *,
+    executor: Executor | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+) -> None:
+    try:
+        event = Event.decode(msg.data)
+    except Exception:
+        logger.exception("Failed to decode event on %s; acking and dropping", SIMULATION_SUBJECT)
+        await msg.ack()
+        app_metrics.worker_messages.add(1, {"outcome": "drop_decode"})
+        return
+
+    simulation_id = event.data.get("simulation_id") if isinstance(event.data, dict) else None
+    if not isinstance(simulation_id, int):
+        logger.error(
+            "Event on %s has missing/invalid simulation_id: %r",
+            SIMULATION_SUBJECT,
+            event.data,
+        )
+        await msg.ack()
+        app_metrics.worker_messages.add(1, {"outcome": "drop_invalid_id"})
+        return
+
+    try:
+        outcome = await _process(simulation_id, msg, executor=executor, semaphore=semaphore)
+    except _TransientError as exc:
+        logger.warning(
+            "Transient failure for simulation %d, will redeliver: %s", simulation_id, exc
+        )
+        await msg.nak(delay=_NAK_RETRY_DELAY_SECONDS)
+        app_metrics.worker_messages.add(1, {"outcome": "nak"})
+        return
+    except Exception:
+        # Catch-all so the subscription never dies. Treat as deterministic:
+        # mark FAILED rather than redeliver indefinitely.
+        logger.exception("Unhandled error processing simulation %d", simulation_id)
+        await persistence.save_failure(simulation_id, "unhandled_worker_error")
+        await msg.ack()
+        app_metrics.worker_messages.add(1, {"outcome": "ack_unhandled"})
+        return
+
+    await msg.ack()
+    if outcome.storage_key is not None:
+        await _delete_safely(outcome.storage_key)
+    app_metrics.worker_messages.add(1, {"outcome": "ack"})
+
+
+def _run_simulation_subprocess(
+    key: SimulationKeyInput, raw: data_loading.SimulationRawData
+) -> KeySimResult:
+    """Top-level, picklable entry executed inside a solver pool process.
+
+    The pool initializer (``worker.main._init_solver_process``) has already
+    imported ``simulation.compute`` in this process. ``run_simulation`` is pure
+    synchronous CPU work, so there is nothing async to drive here. ``key``
+    (pydantic), ``raw`` (numpy arrays + names) and the ``KeySimResult`` are all
+    picklable, so they cross the process boundary cleanly.
+    """
+    return run_simulation(key, raw.C, raw.VA, raw.consumer_names)
+
+
+async def _run_simulation(
+    key: SimulationKeyInput,
+    raw: data_loading.SimulationRawData,
+    *,
+    executor: Executor | None,
+    semaphore: asyncio.Semaphore | None,
+) -> KeySimResult:
+    """Run the solve, off the event loop when a process pool is configured.
+
+    With ``executor`` set, the CPU-bound solve runs in a separate process so the
+    event loop stays responsive (NATS liveness + heartbeat) and several solves
+    can use several cores. ``semaphore`` caps how many run at once. Without an
+    executor (unit tests / single-process fallback) it runs inline, preserving
+    the original behaviour and the ``run_simulation`` monkeypatch seam the tests
+    use.
+    """
+    if executor is None:
+        return run_simulation(key, raw.C, raw.VA, raw.consumer_names)
+    loop = asyncio.get_running_loop()
+    try:
+        if semaphore is None:
+            return await loop.run_in_executor(executor, _run_simulation_subprocess, key, raw)
+        async with semaphore:
+            return await loop.run_in_executor(executor, _run_simulation_subprocess, key, raw)
+    except BrokenExecutor as exc:
+        # A pool worker died abnormally (OOM, native crash). Treat as transient —
+        # redeliver rather than wrongly mark this simulation FAILED. The pool
+        # rebuilds itself on the next submit (see worker.main._SolverPool), so the
+        # redelivery lands on a fresh worker.
+        raise _TransientError(f"solver pool broken: {exc}") from exc
+
+
+async def _process(
+    simulation_id: int,
+    msg: Msg,
+    *,
+    executor: Executor | None = None,
+    semaphore: asyncio.Semaphore | None = None,
+) -> _Terminal:
     # ---- Step 1: snapshot the row, then close the session --------------
     snapshot = await _snapshot_simulation(simulation_id)
     if snapshot is None:
@@ -202,10 +315,14 @@ async def _process(simulation_id: int, msg: Msg) -> _Terminal:
         await persistence.save_failure(simulation_id, f"parse_failed_unexpected: {exc}")
         return _Terminal(storage_key=snapshot.file_storage_key)
 
-    # ---- Step 5: run the simulation (no DB session held) ---------------
+    # ---- Step 5: run the simulation off the event loop ----------------
     start = time.perf_counter()
     try:
-        result = run_simulation(key_input, raw.C, raw.VA, raw.consumer_names)
+        result = await _run_simulation(key_input, raw, executor=executor, semaphore=semaphore)
+    except _TransientError:
+        # Broken solver pool (a worker died). Redeliver — don't mark FAILED.
+        app_metrics.simulation_duration.record(time.perf_counter() - start, {"status": "failed"})
+        raise
     except SimulationInputError as exc:
         app_metrics.simulation_duration.record(time.perf_counter() - start, {"status": "failed"})
         await persistence.save_failure(simulation_id, f"simulation_failed: {exc}")

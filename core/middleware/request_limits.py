@@ -5,10 +5,17 @@ Protects against oversized payloads and slow-loris / hung-request attacks.
 
 Body size check:
     Reads Content-Length before the request reaches FastAPI's body parser.
-    If the header exceeds MAX_BODY_BYTES, the request is rejected immediately
-    with 413 Payload Too Large — no memory is allocated for the body.
-    Requests without Content-Length (chunked transfer) are checked
-    after the body has been read by the framework.
+    If the declared length exceeds the per-route cap (see ``_max_body_for``),
+    the request is rejected immediately with 413 Payload Too Large, before any
+    body is read into memory.
+
+    This is a cheap up-front gate, not a complete one. A client using chunked
+    transfer-encoding sends no Content-Length and so slips past this check; the
+    middleware cannot bound such a body without first buffering it, which would
+    allocate the very memory the cap exists to prevent. The memory bound is
+    therefore enforced again where the body is actually loaded: the simulation
+    upload handler reads the file in bounded chunks and rejects at
+    UPLOAD_MAX_BODY_BYTES (see api/simulation/service.py::_read_within_cap).
 
 Request timeout:
     Wraps the entire downstream handler in asyncio.wait_for().
@@ -31,15 +38,16 @@ logger = logging.getLogger(__name__)
 # 2 MB — generous for a JSON API, covers PDF upload metadata but blocks abuse
 MAX_BODY_BYTES = 2 * 1024 * 1024
 
-# Larger cap for explicit upload endpoints (POST /generation/ multipart).
-# 50 MB covers realistic energy datasets (hourly * 365 days * hundreds of
-# consumers) loaded fully into memory in the route handler. Bump this only
-# after moving the upload to a streaming put_object.
+# Larger cap for the explicit upload endpoint (POST / multipart — the
+# simulation upload). 50 MB covers realistic energy datasets (15-min * 365 days
+# * many consumers) loaded fully into memory in the route handler. Bump this
+# only after moving the upload to a streaming put_object.
 UPLOAD_MAX_BODY_BYTES = 50 * 1024 * 1024
 
-# Path + method pairs that get the larger upload cap. Match on POST only —
-# GET/DELETE on the same path keep the default.
-_UPLOAD_ROUTES: tuple[tuple[str, str], ...] = (("POST", "/generation/"),)
+# Path + method pairs that get the larger upload cap. The simulation upload is
+# POST / (simulation_routes is mounted without a prefix in main.py). Match on
+# POST only — GET/DELETE on the same path keep the default.
+_UPLOAD_ROUTES: tuple[tuple[str, str], ...] = (("POST", "/"),)
 
 # 30 seconds — covers complex DB queries / PDF generation
 TIMEOUT_SECONDS = 30

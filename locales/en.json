@@ -19,7 +19,8 @@
       "START_SIMULATION": "Failed to start the simulation (code: 2106)",
       "DELETE_SIMULATION": "Failed to delete the simulation (code: 2107)",
       "RESULT_NOT_FOUND": "Simulation results not found (code: 2108)",
-      "GET_TIMESERIES": "Failed to retrieve the simulation time series (code: 2109)"
+      "GET_TIMESERIES": "Failed to retrieve the simulation time series (code: 2109)",
+      "FILE_TOO_LARGE": "The file exceeds the maximum allowed size (code: 2110)"
     }
   }
 }

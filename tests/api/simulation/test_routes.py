@@ -167,6 +167,90 @@ async def test_start_simulation_foreign_key_returns_404(
     mock_upload.assert_not_awaited()
 
 
+def _multipart_body(
+    boundary: str,
+    *,
+    name: str,
+    id_key: int,
+    injection_name: str,
+    filename: str,
+    file_bytes: bytes,
+    content_type: str = "text/csv",
+) -> bytes:
+    """Hand-build a multipart/form-data body so it can be streamed without a
+    Content-Length (httpx only omits the header when given an async iterator)."""
+    bnd = f"--{boundary}".encode()
+
+    def text_field(field_name: str, value: str) -> bytes:
+        return (
+            bnd
+            + f'\r\nContent-Disposition: form-data; name="{field_name}"\r\n\r\n{value}\r\n'.encode()
+        )
+
+    file_field = (
+        bnd
+        + f'\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
+        + f"Content-Type: {content_type}\r\n\r\n".encode()
+        + file_bytes
+        + b"\r\n"
+    )
+    return (
+        text_field("name", name)
+        + text_field("id_key", str(id_key))
+        + text_field("injection_name", injection_name)
+        + file_field
+        + bnd
+        + b"--\r\n"
+    )
+
+
+@patch("api.simulation.service.storage.upload", new_callable=AsyncMock)
+async def test_start_simulation_chunked_body_over_cap_returns_413(
+    mock_upload, monkeypatch, client, db_session
+):
+    """A chunked upload (no Content-Length) over the cap is rejected.
+
+    RequestLimitsMiddleware can only screen the Content-Length header, so a
+    chunked request slips past it; the handler's bounded read must catch it.
+    The cap is shrunk so the test body stays tiny.
+    """
+    community = await _community_with_subscription(db_session)
+    key = await create_crm_key(db_session, id_community=community.id, name="My key")
+
+    # Patch the binding the service actually reads (it imported the name).
+    monkeypatch.setattr("api.simulation.service.UPLOAD_MAX_BODY_BYTES", 64)
+
+    boundary = "testboundaryDEADBEEF"
+    body = _multipart_body(
+        boundary,
+        name="big sim",
+        id_key=key.id,
+        injection_name="production",
+        filename="big.csv",
+        file_bytes=b"A" * 256,  # well over the 64-byte cap
+    )
+
+    async def _chunked_stream():
+        # Two yields => httpx uses Transfer-Encoding: chunked with no
+        # Content-Length, which is exactly the case the middleware can't screen.
+        mid = len(body) // 2
+        yield body[:mid]
+        yield body[mid:]
+
+    response = await client.post(
+        "/",
+        headers={
+            **_admin_headers(community),
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        content=_chunked_stream(),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error_code"] == 2110  # FILE_TOO_LARGE
+    mock_upload.assert_not_awaited()  # rejected before the storage write
+
+
 @patch("api.simulation.service.storage.upload", new_callable=AsyncMock)
 async def test_start_simulation_empty_file_returns_422(mock_upload, client, db_session):
     community = await _community_with_subscription(db_session)

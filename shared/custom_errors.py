@@ -29,6 +29,10 @@ class _SimulationErrors:
     # The per-timestep time-series result object is missing from storage.
     RESULT_NOT_FOUND = Error(code=2108, key="ERRORS.SIMULATION.RESULT_NOT_FOUND")
     GET_TIMESERIES = Error(code=2109, key="ERRORS.SIMULATION.GET_TIMESERIES")
+    # The uploaded file exceeds UPLOAD_MAX_BODY_BYTES. Raised by the upload
+    # handler's bounded read, which catches oversized bodies the request-limits
+    # middleware can't pre-screen (chunked / no Content-Length). Maps to 413.
+    FILE_TOO_LARGE = Error(code=2110, key="ERRORS.SIMULATION.FILE_TOO_LARGE")
 
 
 class _Errors:

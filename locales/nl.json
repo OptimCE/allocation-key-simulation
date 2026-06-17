@@ -19,7 +19,8 @@
       "START_SIMULATION": "Starten van de simulatie mislukt (code: 2106)",
       "DELETE_SIMULATION": "Verwijderen van de simulatie mislukt (code: 2107)",
       "RESULT_NOT_FOUND": "Simulatieresultaten niet gevonden (code: 2108)",
-      "GET_TIMESERIES": "Ophalen van de tijdreeksen van de simulatie mislukt (code: 2109)"
+      "GET_TIMESERIES": "Ophalen van de tijdreeksen van de simulatie mislukt (code: 2109)",
+      "FILE_TOO_LARGE": "Het bestand overschrijdt de maximaal toegestane grootte (code: 2110)"
     }
   }
 }

@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements/worker.txt
 FROM python:3.12-slim
 
 # tini gives us a real PID 1: forwards SIGTERM to the Python process and
-# reaps any zombie subprocesses.
+# reaps zombies from the solver process pool on shutdown.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tini \
     && rm -rf /var/lib/apt/lists/*
@@ -19,8 +19,15 @@ RUN apt-get update \
 # Security: non-root user
 RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
 
+# One math thread per solver process: the worker runs several solves in parallel
+# across a process pool, so letting each spawn its own BLAS thread pool would
+# oversubscribe the CPU quota. Override at deploy time if a single large solve
+# benefits more from intra-solve threading than cross-solve parallelism.
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1
 
 WORKDIR /app
 

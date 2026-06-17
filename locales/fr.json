@@ -19,7 +19,8 @@
       "START_SIMULATION": "Échec du démarrage de la simulation (code: 2106)",
       "DELETE_SIMULATION": "Échec de la suppression de la simulation (code: 2107)",
       "RESULT_NOT_FOUND": "Résultats de simulation introuvables (code: 2108)",
-      "GET_TIMESERIES": "Échec de la récupération des séries temporelles de la simulation (code: 2109)"
+      "GET_TIMESERIES": "Échec de la récupération des séries temporelles de la simulation (code: 2109)",
+      "FILE_TOO_LARGE": "Le fichier dépasse la taille maximale autorisée (code: 2110)"
     }
   }
 }

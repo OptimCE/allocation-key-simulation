@@ -19,7 +19,8 @@
       "START_SIMULATION": "Die Simulation konnte nicht gestartet werden (Code: 2106)",
       "DELETE_SIMULATION": "Die Simulation konnte nicht gelöscht werden (Code: 2107)",
       "RESULT_NOT_FOUND": "Simulationsergebnisse nicht gefunden (Code: 2108)",
-      "GET_TIMESERIES": "Zeitreihen der Simulation konnten nicht abgerufen werden (Code: 2109)"
+      "GET_TIMESERIES": "Zeitreihen der Simulation konnten nicht abgerufen werden (Code: 2109)",
+      "FILE_TOO_LARGE": "Die Datei überschreitet die maximal zulässige Größe (Code: 2110)"
     }
   }
 }
