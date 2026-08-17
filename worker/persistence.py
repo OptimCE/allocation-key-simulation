@@ -28,6 +28,7 @@ from core import metrics as app_metrics
 from core import storage
 from core.audit_log import AuditActions, AuditLogInput, AuditLogService
 from core.database.database import AsyncSessionCRMFactory, AsyncSessionLocalFactory
+from core.realtime import CommunityAudience, Tier, emit
 from shared.const import SimulationStatus
 from shared.models.local_models import (
     SimulationConsumerResultModel,
@@ -181,6 +182,23 @@ async def save_success(simulation_id: int, result: KeySimResult) -> None:
         )
         await crm_session.commit()
 
+    # Realtime hint, AFTER both commits. Fire-and-forget: dropped if nobody has
+    # the hub open, which is correct — the row is durable and the hub's own
+    # poller converges regardless.
+    #
+    # Audience is the community's MANAGER tier, not a user: `simulation` carries
+    # only `id_community`, and the hub route is manager-gated
+    # (annexes-services.routes.ts, minRole GESTIONNAIRE). A worker with no
+    # request context reaches exactly the right people with zero lookups.
+    await emit(
+        topic="simulation.finished",
+        audience=CommunityAudience(community_id=community_id, tier=Tier.MANAGER),
+        resource=("simulation", simulation_id),
+        scope_community_id=community_id,
+        hint={"status": "success"},
+    )
+
+
 
 async def save_failure(simulation_id: int, error_message: str) -> None:
     """Mark a simulation FAILED with the given message (idempotent)."""
@@ -220,3 +238,14 @@ async def save_failure(simulation_id: int, error_message: str) -> None:
             id_community=id_community,
         )
         await crm_session.commit()
+
+    # Same contract as save_success. No error message in the envelope — it is a
+    # hint; the client refetches through the gateway, which re-authorizes.
+    await emit(
+        topic="simulation.finished",
+        audience=CommunityAudience(community_id=id_community, tier=Tier.MANAGER),
+        resource=("simulation", simulation_id),
+        scope_community_id=id_community,
+        hint={"status": "failed"},
+    )
+
