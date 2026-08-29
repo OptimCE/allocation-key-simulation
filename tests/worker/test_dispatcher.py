@@ -20,6 +20,7 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from core.queue.helper import Event
+from shared.const import DataSource
 from worker import dispatcher
 
 _KEY = "simulations/1/test-uuid/data.csv"
@@ -47,9 +48,13 @@ def _event_bytes(simulation_id) -> bytes:
 def _snapshot(*, status: int = 0, file_storage_key: str = _KEY) -> dispatcher._SimulationSnapshot:
     return dispatcher._SimulationSnapshot(
         id=1,
+        source=DataSource.FILE,
         file_storage_key=file_storage_key,
         file_name="data.csv",
         injection_name="production",
+        id_sharing_operation=None,
+        period_start=None,
+        period_end=None,
         id_key=10,
         id_community=1,
         status=int(status),
@@ -194,12 +199,14 @@ async def test_compute_error_marks_failed(monkeypatch, patched_save, stub_pipeli
 
 
 async def test_storage_object_missing_marks_failed_no_delete(
-    monkeypatch, patched_save, patched_storage
+    monkeypatch, patched_save, patched_storage, stub_pipeline
 ):
     save_success, save_failure = patched_save
     download, delete = patched_storage
     download.side_effect = dispatcher.storage.ObjectNotFound("gone")
-    monkeypatch.setattr(dispatcher, "_snapshot_simulation", AsyncMock(return_value=_snapshot()))
+    # stub_pipeline is what makes the CRM key read succeed. It runs before the
+    # source is loaded now (both source paths need the key's participant names),
+    # so it has to pass for this test to reach the storage branch it is about.
     msg = FakeMsg(_event_bytes(1))
     await dispatcher._make_handler()(msg)
     assert msg.acked
@@ -210,11 +217,12 @@ async def test_storage_object_missing_marks_failed_no_delete(
 # ---- Transient failures (nak + NO delete) ----------------------------------
 
 
-async def test_storage_transient_naks_no_delete(monkeypatch, patched_save, patched_storage):
+async def test_storage_transient_naks_no_delete(
+    monkeypatch, patched_save, patched_storage, stub_pipeline
+):
     save_success, save_failure = patched_save
     download, delete = patched_storage
     download.side_effect = dispatcher.storage.TransientStorageError("503")
-    monkeypatch.setattr(dispatcher, "_snapshot_simulation", AsyncMock(return_value=_snapshot()))
     msg = FakeMsg(_event_bytes(1))
     await dispatcher._make_handler()(msg)
     assert msg.naked and not msg.acked

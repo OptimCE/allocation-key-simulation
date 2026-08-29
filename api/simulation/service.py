@@ -1,3 +1,4 @@
+import datetime
 import logging
 from uuid import uuid4
 
@@ -6,6 +7,7 @@ from fastapi import UploadFile
 from api.simulation.mappers import to_simulation_detail, to_simulation_schema
 from api.simulation.repository import SimulationRepository
 from api.simulation.schemas import (
+    SimulateFromCrmRequest,
     SimulateRequest,
     SimulateResponse,
     Simulation,
@@ -21,10 +23,17 @@ from core.errors.errors import ErrorException
 from core.middleware.request_limits import UPLOAD_MAX_BODY_BYTES
 from core.queue.helper import Event, send_event
 from core.queue.init import get_jetstream
-from shared.const import SIMULATION_SUBJECT, SimulationStatus
+from shared import crm_preflight
+from shared.const import SIMULATION_SUBJECT, DataSource, SimulationStatus
+from shared.crm_meter_repository import CrmMeterRepository
+from shared.crm_preflight import Preflight
 from shared.crm_repository import CRMRepository
 from shared.custom_errors import errors
 from shared.models.local_models import SimulationModel
+from simulation.key_mapping import (
+    consumer_names_of,
+    from_crm_allocation_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +99,128 @@ class SimulationService:
         except storage.ObjectNotFound as exc:
             raise ErrorException(error=errors.simulation.RESULT_NOT_FOUND, status_code=404) from exc
         return SimulationTimeseries.model_validate_json(content)
+
+    # ------------------------------------------------------------------
+    # CRM-sourced simulation
+    # ------------------------------------------------------------------
+
+    async def preview_crm_data(
+        self,
+        *,
+        id_key: int,
+        id_sharing_operation: int,
+        period_start: datetime.date,
+        period_end: datetime.date,
+        community_id: int,
+    ) -> Preflight:
+        """Aggregate the period and check it against the key, running nothing.
+
+        Also the pre-flight for ``start_simulation_from_crm`` — one code path, so
+        the answer the manager saw and the answer that gates the run cannot drift.
+        """
+        if period_start > period_end:
+            raise ErrorException(error=errors.simulation.INVALID_PERIOD, status_code=422)
+
+        key = await self.crm_repository.get_allocation_key(id_key, community_id)
+        if key is None:
+            raise ErrorException(error=errors.simulation.KEY_NOT_FOUND, status_code=404)
+
+        crm_meters = CrmMeterRepository(self.crm_session)
+        # Explicit tenant check: without it a foreign operation id is
+        # indistinguishable from an empty period, which is a confusing 422 for a
+        # legitimate user and a soft information leak for everyone else.
+        if not await crm_meters.sharing_operation_exists(
+            id_community=community_id, id_sharing_operation=id_sharing_operation
+        ):
+            raise ErrorException(
+                error=errors.simulation.SHARING_OPERATION_NOT_FOUND, status_code=404
+            )
+
+        summary = await crm_meters.summarize(
+            id_community=community_id,
+            id_sharing_operation=id_sharing_operation,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        return crm_preflight.evaluate(summary, consumer_names_of(from_crm_allocation_key(key)))
+
+    async def start_simulation_from_crm(
+        self, req: SimulateFromCrmRequest, community_id: int
+    ) -> SimulateResponse:
+        """Queue a simulation that reads its input from the CRM.
+
+        Same ordering as the file path minus the upload: validate, commit, then
+        publish. There is no object to roll back, so the ``_best_effort_delete``
+        branches have no counterpart here.
+        """
+        key = await self.crm_repository.get_allocation_key(req.id_key, community_id)
+        if key is None:
+            raise ErrorException(error=errors.simulation.KEY_NOT_FOUND, status_code=404)
+
+        # Re-run the pre-flight rather than trusting whatever the client saw:
+        # the preview may be minutes old, and an import can have landed since.
+        preflight = await self.preview_crm_data(
+            id_key=req.id_key,
+            id_sharing_operation=req.id_sharing_operation,
+            period_start=req.period_start,
+            period_end=req.period_end,
+            community_id=community_id,
+        )
+        if preflight.blockers:
+            first = preflight.blockers[0]
+            logger.info(
+                "CRM simulation refused for community %d op %d key %d: %s",
+                community_id,
+                req.id_sharing_operation,
+                req.id_key,
+                first.detail,
+            )
+            raise ErrorException(error=first.error, status_code=422)
+
+        model = SimulationModel(
+            name=req.name,
+            id_community=community_id,
+            source=DataSource.CRM,
+            id_sharing_operation=req.id_sharing_operation,
+            period_start=req.period_start,
+            period_end=req.period_end,
+            id_key=req.id_key,
+            key_name=key.name,
+            status=SimulationStatus.PENDING,
+            data_warnings=preflight.warnings,
+        )
+        await self.repository.create_simulation(model)
+        await self.local_session.commit()
+        simulation_id = model.id
+        app_metrics.simulations_created.add(1)
+        await self.audit_log_service.log(
+            AuditLogInput(
+                action=AuditActions.SIMULATION_CREATED,
+                entity_type="simulation",
+                entity_id=str(simulation_id),
+                payload={
+                    "name": req.name,
+                    "id_key": req.id_key,
+                    "key_name": key.name,
+                    "source": DataSource.CRM.name,
+                    "id_sharing_operation": req.id_sharing_operation,
+                    "period_start": req.period_start.isoformat(),
+                    "period_end": req.period_end.isoformat(),
+                },
+            )
+        )
+
+        event = Event(type="simulation.requested", data={"simulation_id": simulation_id})
+        try:
+            await send_event(get_jetstream(), SIMULATION_SUBJECT, event)
+        except Exception as exc:
+            logger.exception(
+                "Failed to publish simulation %d to %s", simulation_id, SIMULATION_SUBJECT
+            )
+            await self._mark_failed_to_queue(simulation_id, str(exc))
+            raise ErrorException(error=errors.simulation.START_SIMULATION, status_code=500) from exc
+
+        return SimulateResponse(id=simulation_id, status=SimulationStatus.PENDING)
 
     async def start_simulation(
         self, req: SimulateRequest, file: UploadFile, community_id: int

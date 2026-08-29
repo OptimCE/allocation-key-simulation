@@ -92,3 +92,65 @@ CREATE TABLE IF NOT EXISTS audit_log (
     user_email   VARCHAR(256),
     payload      JSONB        NOT NULL DEFAULT '{}'::jsonb
 );
+
+
+-- ---- Metering tables -------------------------------------------------------
+-- Mirrors crm-backend/database_script/init.sql (meter / meter_data /
+-- meter_consumption / sharing_operation), trimmed to the columns this service
+-- actually SELECTs. Adapted from billing/tests/sql/crm_test_schema.sql, which
+-- carries the same block for the same reason.
+--
+-- Two production properties are reproduced deliberately, because the code under
+-- test depends on both:
+--   * meter_consumption has NO unique constraint on (ean, timestamp) -- that is
+--     what makes a double import possible and CRM_DUPLICATE_READINGS necessary.
+--   * every measure column is nullable, so COALESCE in the queries is load-
+--     bearing rather than defensive.
+
+CREATE TABLE IF NOT EXISTS sharing_operation (
+    id           INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    name         VARCHAR(255) NOT NULL,
+    type         INTEGER      NOT NULL DEFAULT 1,
+    is_public    BOOLEAN      NOT NULL DEFAULT FALSE,
+    id_community INTEGER      NOT NULL REFERENCES community (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS meter (
+    ean               VARCHAR(64) PRIMARY KEY,
+    meter_number      VARCHAR(255),
+    tarif_group       INTEGER,
+    phases_number     INTEGER,
+    reading_frequency INTEGER,
+    id_community      INTEGER NOT NULL REFERENCES community (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS meter_data (
+    id                   INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ean                  VARCHAR(64) NOT NULL REFERENCES meter (ean) ON DELETE CASCADE,
+    id_member            INTEGER,
+    id_sharing_operation INTEGER REFERENCES sharing_operation (id),
+    status               INTEGER,   -- 1=ACTIVE
+    client_type          INTEGER,   -- 1=Residentiel, 2=Professionnel, 3=Industriel
+    injection_status     INTEGER,
+    production_chain     INTEGER,
+    start_date           DATE,
+    end_date             DATE,
+    id_community         INTEGER NOT NULL REFERENCES community (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS meter_consumption (
+    id                   INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ean                  VARCHAR(64) NOT NULL REFERENCES meter (ean) ON DELETE CASCADE,
+    id_sharing_operation INTEGER REFERENCES sharing_operation (id),
+    timestamp            TIMESTAMPTZ NOT NULL,
+    gross                DOUBLE PRECISION,
+    net                  DOUBLE PRECISION,
+    shared               DOUBLE PRECISION,
+    inj_gross            DOUBLE PRECISION,
+    inj_shared           DOUBLE PRECISION,
+    inj_net              DOUBLE PRECISION,
+    id_community         INTEGER NOT NULL REFERENCES community (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_meter_consumption_lookup
+    ON meter_consumption (id_sharing_operation, timestamp);

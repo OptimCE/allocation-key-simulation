@@ -20,7 +20,15 @@
       "DELETE_SIMULATION": "Échec de la suppression de la simulation (code: 2107)",
       "RESULT_NOT_FOUND": "Résultats de simulation introuvables (code: 2108)",
       "GET_TIMESERIES": "Échec de la récupération des séries temporelles de la simulation (code: 2109)",
-      "FILE_TOO_LARGE": "Le fichier dépasse la taille maximale autorisée (code: 2110)"
+      "FILE_TOO_LARGE": "Le fichier dépasse la taille maximale autorisée (code: 2110)",
+      "INVALID_PERIOD": "La date de début doit précéder la date de fin (code: 2111)",
+      "SHARING_OPERATION_NOT_FOUND": "Opération de partage introuvable (code: 2112)",
+      "CRM_NO_DATA": "Aucune donnée de comptage pour cette opération de partage sur cette période (code: 2113)",
+      "CRM_DUPLICATE_READINGS": "Des relevés en double ont été détectés : les données ont probablement été importées deux fois (code: 2114)",
+      "CRM_NO_INJECTION": "Aucune injection sur cette période : il n'y a rien à partager (code: 2115)",
+      "CRM_RANGE_TOO_LARGE": "La période sélectionnée contient trop de relevés, veuillez la raccourcir (code: 2116)",
+      "KEY_CONSUMERS_NOT_MATCHED": "Certains participants de la clé ne correspondent à aucun compteur (EAN) sur cette période (code: 2117)",
+      "GET_CRM_PREVIEW": "Impossible de vérifier les données de comptage (code: 2118)"
     }
   }
 }

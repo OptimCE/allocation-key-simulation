@@ -29,6 +29,10 @@ INSERT into schema_version (version, description) VALUES(
        1, 'First version'
 ) ON CONFLICT DO NOTHING;
 
+INSERT into schema_version (version, description) VALUES(
+       2, 'Allow CRM-sourced simulations (source, sharing operation, period)'
+) ON CONFLICT DO NOTHING;
+
 
 -- ---- simulation ------------------------------------------------------------
 -- One row per simulation request. Holds the source file reference, a snapshot
@@ -41,12 +45,24 @@ CREATE TABLE IF NOT EXISTS simulation (
     name               VARCHAR(255) NOT NULL,
     id_community       INTEGER NOT NULL,
 
-    -- Source data
-    -- file_storage_key is the object key inside STORAGE_BUCKET (MinIO). The
-    -- service uploads on creation; the worker deletes on terminal outcomes.
-    file_storage_key   VARCHAR(512) NOT NULL,
-    file_name          VARCHAR(255) NOT NULL,
-    injection_name     VARCHAR(255) NOT NULL,
+    -- Source data: 1=FILE (uploaded CSV/XLSX), 2=CRM (meter_consumption).
+    -- Exactly one of the two column groups below is populated; the
+    -- ck_simulation_source CHECK is what enforces that, now that the file
+    -- columns can no longer be NOT NULL.
+    source             SMALLINT     NOT NULL DEFAULT 1,
+
+    -- FILE only. file_storage_key is the object key inside STORAGE_BUCKET
+    -- (MinIO). The service uploads on creation; the worker deletes on terminal
+    -- outcomes. injection_name names the production column inside the file.
+    file_storage_key   VARCHAR(512) NULL,
+    file_name          VARCHAR(255) NULL,
+    injection_name     VARCHAR(255) NULL,
+
+    -- CRM only. The sharing operation and the inclusive local date range read
+    -- from meter_consumption. No FK: the CRM lives in a separate database.
+    id_sharing_operation INTEGER    NULL,
+    period_start       DATE         NULL,
+    period_end         DATE         NULL,
 
     -- Simulated key snapshot (the CRM allocation_key; no FK — separate DB)
     id_key             INTEGER      NOT NULL,
@@ -59,8 +75,25 @@ CREATE TABLE IF NOT EXISTS simulation (
     -- Object key of the per-timestep time-series JSON written on success.
     result_storage_key VARCHAR(512) NULL,
 
+    -- Non-blocking findings from the CRM pre-flight (participants whose meter
+    -- has gaps, which are zero-filled). Persisted so the warning outlives the
+    -- preview screen.
+    data_warnings      JSONB        NULL,
+
     created_at         TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at         TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at         TIMESTAMPTZ  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT ck_simulation_source CHECK (
+        (source = 1
+            AND file_storage_key IS NOT NULL
+            AND file_name        IS NOT NULL
+            AND injection_name   IS NOT NULL)
+     OR (source = 2
+            AND id_sharing_operation IS NOT NULL
+            AND period_start         IS NOT NULL
+            AND period_end           IS NOT NULL
+            AND period_start <= period_end)
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_simulation_id_community ON simulation (id_community);

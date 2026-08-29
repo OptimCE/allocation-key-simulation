@@ -20,7 +20,15 @@
       "DELETE_SIMULATION": "Failed to delete the simulation (code: 2107)",
       "RESULT_NOT_FOUND": "Simulation results not found (code: 2108)",
       "GET_TIMESERIES": "Failed to retrieve the simulation time series (code: 2109)",
-      "FILE_TOO_LARGE": "The file exceeds the maximum allowed size (code: 2110)"
+      "FILE_TOO_LARGE": "The file exceeds the maximum allowed size (code: 2110)",
+      "INVALID_PERIOD": "The start date must be on or before the end date (code: 2111)",
+      "SHARING_OPERATION_NOT_FOUND": "Sharing operation not found (code: 2112)",
+      "CRM_NO_DATA": "No metering data for this sharing operation over this period (code: 2113)",
+      "CRM_DUPLICATE_READINGS": "Duplicate readings detected: the data was most likely imported twice (code: 2114)",
+      "CRM_NO_INJECTION": "No energy was injected over this period, so there is nothing to share (code: 2115)",
+      "CRM_RANGE_TOO_LARGE": "The selected period holds too many readings, please shorten it (code: 2116)",
+      "KEY_CONSUMERS_NOT_MATCHED": "Some of the key's participants match no meter (EAN) over this period (code: 2117)",
+      "GET_CRM_PREVIEW": "The metering data could not be checked (code: 2118)"
     }
   }
 }

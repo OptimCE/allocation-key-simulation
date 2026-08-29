@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import datetime
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -37,12 +38,17 @@ from core import metrics as app_metrics
 from core import storage
 from core.database.database import AsyncSessionCRMFactory, AsyncSessionLocalFactory
 from core.queue.helper import Event
-from shared import data_loading
-from shared.const import SIMULATION_SUBJECT, SimulationStatus
+from shared import crm_preflight, crm_timeseries, data_loading
+from shared.const import SIMULATION_SUBJECT, DataSource, SimulationStatus
+from shared.crm_meter_repository import CrmMeterRepository
 from shared.crm_repository import CRMRepository
 from shared.models.local_models import SimulationModel
 from simulation.compute import SimulationInputError, run_simulation
-from simulation.inputs import SimulationKeyInput
+from simulation.inputs import (
+    SimulationConsumerInput,
+    SimulationIterationInput,
+    SimulationKeyInput,
+)
 from simulation.key_mapping import consumer_names_of, from_crm_allocation_key
 from simulation.result import KeySimResult
 from worker import persistence
@@ -67,9 +73,15 @@ class _SimulationSnapshot:
     """Per-message snapshot of the row, captured before the session closes."""
 
     id: int
-    file_storage_key: str
-    file_name: str
-    injection_name: str
+    source: DataSource
+    # FILE only — None on a CRM-sourced row.
+    file_storage_key: str | None
+    file_name: str | None
+    injection_name: str | None
+    # CRM only — None on a file-sourced row.
+    id_sharing_operation: int | None
+    period_start: datetime.date | None
+    period_end: datetime.date | None
     id_key: int
     id_community: int
     status: int
@@ -275,16 +287,10 @@ async def _process(
         )
         return _Terminal(storage_key=snapshot.file_storage_key)
 
-    # ---- Step 2: download the source file ------------------------------
-    try:
-        content = await storage.download(snapshot.file_storage_key)
-    except storage.ObjectNotFound:
-        await persistence.save_failure(simulation_id, "storage_object_missing")
-        return _Terminal(storage_key=None)
-    except storage.TransientStorageError as exc:
-        raise _TransientError(f"storage download: {exc}") from exc
-
-    # ---- Step 3: read the simulated key from the CRM DB ----------------
+    # ---- Step 2: read the simulated key from the CRM DB ----------------
+    # Ahead of the source read because both paths need the key's participant
+    # names: the file path matches columns against them, the CRM path matches
+    # meter EANs against them.
     try:
         key_model = await _read_crm_key(snapshot.id_key, snapshot.id_community)
     except Exception as exc:
@@ -297,23 +303,25 @@ async def _process(
         return _Terminal(storage_key=snapshot.file_storage_key)
 
     key_input = from_crm_allocation_key(key_model)
+    if snapshot.source is DataSource.CRM:
+        # Match EANs the way the rest of the platform does, with TRIM. The key
+        # itself is normalised (not just the comparison) so that run_simulation's
+        # own name -> percentage lookup still resolves: it keys off the input
+        # model's names, which must therefore be the same strings as the matrix
+        # column labels. The file path is deliberately left untrimmed — changing
+        # its matching would alter existing behaviour.
+        key_input = _with_trimmed_participants(key_input)
     consumer_names = consumer_names_of(key_input)
 
-    # ---- Step 4: parse the file (consumer columns matched by name) -----
-    try:
-        raw = data_loading.load(
-            content, snapshot.file_name, snapshot.injection_name, consumer_names
-        )
-    except (
-        data_loading.InvalidInjectionColumnError,
-        data_loading.UnsupportedFileFormatError,
-        data_loading.ConsumerColumnsError,
-    ) as exc:
-        await persistence.save_failure(simulation_id, f"parse_failed: {exc}")
-        return _Terminal(storage_key=snapshot.file_storage_key)
-    except Exception as exc:
-        await persistence.save_failure(simulation_id, f"parse_failed_unexpected: {exc}")
-        return _Terminal(storage_key=snapshot.file_storage_key)
+    # ---- Step 3: obtain the (C, VA, names) triple ----------------------
+    # Two sources, one output. Everything downstream is identical.
+    if snapshot.source is DataSource.CRM:
+        loaded = await _load_from_crm(snapshot, consumer_names)
+    else:
+        loaded = await _load_from_file(snapshot, consumer_names)
+    if isinstance(loaded, _Terminal):
+        return loaded
+    raw = loaded
 
     # ---- Step 5: run the simulation off the event loop ----------------
     start = time.perf_counter()
@@ -346,6 +354,141 @@ async def _process(
     return _Terminal(storage_key=snapshot.file_storage_key)
 
 
+def _with_trimmed_participants(key: SimulationKeyInput) -> SimulationKeyInput:
+    """Return the key with every consumer name trimmed.
+
+    ``allocation_key.consumer.name`` is free text with no FK to ``meter``; the
+    platform-wide convention that it holds the EAN is enforced only by
+    comparison, and crm-backend compares with ``TRIM``. Normalising the whole
+    key (rather than only the comparison) keeps one set of strings in play
+    across matching, the matrix column labels, and the result rows.
+    """
+    return SimulationKeyInput(
+        name=key.name,
+        description=key.description,
+        iterations=[
+            SimulationIterationInput(
+                number=it.number,
+                energy_allocated_percentage=it.energy_allocated_percentage,
+                consumers=[
+                    SimulationConsumerInput(
+                        name=crm_preflight.normalize_participant(c.name),
+                        energy_allocated_percentage=c.energy_allocated_percentage,
+                    )
+                    for c in it.consumers
+                ],
+            )
+            for it in key.iterations
+        ],
+    )
+
+
+async def _load_from_file(
+    snapshot: _SimulationSnapshot, consumer_names: list[str]
+) -> data_loading.SimulationRawData | _Terminal:
+    """Download the uploaded object and parse it. The historical path."""
+    if snapshot.file_storage_key is None or snapshot.file_name is None:
+        # Unreachable through the API (ck_simulation_source enforces it), but a
+        # row written directly to the DB could get here.
+        await persistence.save_failure(snapshot.id, "file_source_incomplete")
+        return _Terminal(storage_key=None)
+
+    try:
+        content = await storage.download(snapshot.file_storage_key)
+    except storage.ObjectNotFound:
+        await persistence.save_failure(snapshot.id, "storage_object_missing")
+        return _Terminal(storage_key=None)
+    except storage.TransientStorageError as exc:
+        raise _TransientError(f"storage download: {exc}") from exc
+
+    try:
+        return data_loading.load(
+            content, snapshot.file_name, snapshot.injection_name or "", consumer_names
+        )
+    except (
+        data_loading.InvalidInjectionColumnError,
+        data_loading.UnsupportedFileFormatError,
+        data_loading.ConsumerColumnsError,
+    ) as exc:
+        await persistence.save_failure(snapshot.id, f"parse_failed: {exc}")
+        return _Terminal(storage_key=snapshot.file_storage_key)
+    except Exception as exc:
+        await persistence.save_failure(snapshot.id, f"parse_failed_unexpected: {exc}")
+        return _Terminal(storage_key=snapshot.file_storage_key)
+
+
+async def _load_from_crm(
+    snapshot: _SimulationSnapshot, consumer_names: list[str]
+) -> data_loading.SimulationRawData | _Terminal:
+    """Read meter_consumption for this row's sharing operation and period.
+
+    The pre-flight is re-run here rather than trusted from creation time: the
+    data can have changed since the run was queued, and this is the read that
+    actually feeds the simulation. In particular the participant-to-EAN match is
+    re-checked, so a meter deleted in the meantime fails loudly.
+
+    Failure classification follows the module's existing matrix — a CRM read
+    error is transient (NAK, redeliver), while rejected or unpivotable data is
+    deterministic (FAILED, ack). There is never an object to delete.
+    """
+    if (
+        snapshot.id_sharing_operation is None
+        or snapshot.period_start is None
+        or snapshot.period_end is None
+    ):
+        await persistence.save_failure(snapshot.id, "crm_source_incomplete")
+        return _Terminal(storage_key=None)
+
+    try:
+        async with AsyncSessionCRMFactory() as crm_session:
+            repository = CrmMeterRepository(crm_session)
+            # The worker has no request context, so the community is passed
+            # explicitly; with_community_scope would degrade to WHERE false.
+            summary = await repository.summarize(
+                id_community=snapshot.id_community,
+                id_sharing_operation=snapshot.id_sharing_operation,
+                period_start=snapshot.period_start,
+                period_end=snapshot.period_end,
+            )
+            preflight = crm_preflight.evaluate(summary, consumer_names)
+            # Skip the expensive read when the period is already rejected.
+            rows = (
+                await repository.fetch_rows(
+                    id_community=snapshot.id_community,
+                    id_sharing_operation=snapshot.id_sharing_operation,
+                    period_start=snapshot.period_start,
+                    period_end=snapshot.period_end,
+                )
+                if preflight.ok
+                else []
+            )
+    except Exception as exc:
+        raise _TransientError(f"crm read: {exc}") from exc
+
+    if preflight.blockers:
+        detail = "; ".join(b.detail for b in preflight.blockers)
+        await persistence.save_failure(snapshot.id, f"crm_data_rejected: {detail}")
+        return _Terminal(storage_key=None)
+
+    try:
+        frame = crm_timeseries.build_dataframe(rows, preflight.participants)
+        # The same converter the file path uses — the frame is deliberately
+        # shaped like a parsed upload so nothing below this line differs.
+        return data_loading.to_simulation_raw_data(
+            frame, crm_timeseries.INJECTION_COLUMN, preflight.participants
+        )
+    except (
+        crm_timeseries.CrmPivotError,
+        data_loading.InvalidInjectionColumnError,
+        data_loading.ConsumerColumnsError,
+    ) as exc:
+        await persistence.save_failure(snapshot.id, f"crm_pivot_failed: {exc}")
+        return _Terminal(storage_key=None)
+    except Exception as exc:
+        await persistence.save_failure(snapshot.id, f"crm_pivot_failed_unexpected: {exc}")
+        return _Terminal(storage_key=None)
+
+
 async def _read_crm_key(id_key: int, id_community: int):
     """Load the simulated key from the CRM DB in a short-lived session.
 
@@ -368,9 +511,13 @@ async def _snapshot_simulation(simulation_id: int) -> _SimulationSnapshot | None
             return None
         return _SimulationSnapshot(
             id=row.id,
+            source=DataSource(row.source),
             file_storage_key=row.file_storage_key,
             file_name=row.file_name,
             injection_name=row.injection_name,
+            id_sharing_operation=row.id_sharing_operation,
+            period_start=row.period_start,
+            period_end=row.period_end,
             id_key=row.id_key,
             id_community=row.id_community,
             status=int(row.status),

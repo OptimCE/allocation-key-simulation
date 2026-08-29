@@ -34,6 +34,27 @@ class _SimulationErrors:
     # middleware can't pre-screen (chunked / no Content-Length). Maps to 413.
     FILE_TOO_LARGE = Error(code=2110, key="ERRORS.SIMULATION.FILE_TOO_LARGE")
 
+    # --- CRM-sourced input (source = DataSource.CRM) -----------------------
+    # Raised by the pre-flight, which runs on the preview endpoint, again on
+    # POST /from-crm, and a third time in the worker against the data as it is
+    # at execution time.
+    INVALID_PERIOD = Error(code=2111, key="ERRORS.SIMULATION.INVALID_PERIOD")
+    SHARING_OPERATION_NOT_FOUND = Error(
+        code=2112, key="ERRORS.SIMULATION.SHARING_OPERATION_NOT_FOUND"
+    )
+    CRM_NO_DATA = Error(code=2113, key="ERRORS.SIMULATION.CRM_NO_DATA")
+    # No unique constraint on meter_consumption(ean, timestamp): a repeated
+    # import silently doubles a participant's energy, so this is fatal rather
+    # than a warning.
+    CRM_DUPLICATE_READINGS = Error(code=2114, key="ERRORS.SIMULATION.CRM_DUPLICATE_READINGS")
+    CRM_NO_INJECTION = Error(code=2115, key="ERRORS.SIMULATION.CRM_NO_INJECTION")
+    CRM_RANGE_TOO_LARGE = Error(code=2116, key="ERRORS.SIMULATION.CRM_RANGE_TOO_LARGE")
+    # The simulated key names participants that no meter in the period matches.
+    # allocation_key.consumer.name has no FK to meter.ean — the platform-wide
+    # convention is that the name IS the EAN, compared after TRIM.
+    KEY_CONSUMERS_NOT_MATCHED = Error(code=2117, key="ERRORS.SIMULATION.KEY_CONSUMERS_NOT_MATCHED")
+    GET_CRM_PREVIEW = Error(code=2118, key="ERRORS.SIMULATION.GET_CRM_PREVIEW")
+
 
 class _Errors:
     auth = _AuthErrors()
