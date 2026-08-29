@@ -1,10 +1,12 @@
 import datetime
+from typing import Any
 
-from sqlalchemy import TIMESTAMP, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import TIMESTAMP, Date, Float, ForeignKey, Integer, SmallInteger, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.database.database import LocalBase
-from shared.const import SimulationStatus
+from shared.const import DataSource, SimulationStatus
 
 
 class SimulationModel(LocalBase):
@@ -27,14 +29,28 @@ class SimulationModel(LocalBase):
     id_community: Mapped[int] = mapped_column(Integer, nullable=False)
 
     # --- Source data ---
-    # file_storage_key is the object key inside STORAGE_BUCKET (MinIO). The
-    # service uploads the user-supplied file at creation time; the worker
-    # deletes it once the row reaches SUCCESS or FAILED.
-    file_storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
-    file_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Which of the two column groups below is populated. The DB-level
+    # ck_simulation_source CHECK enforces the pairing; these columns cannot be
+    # NOT NULL any more because a CRM-sourced run has no file.
+    source: Mapped[DataSource] = mapped_column(
+        SmallInteger, nullable=False, default=DataSource.FILE
+    )
+
+    # FILE only. file_storage_key is the object key inside STORAGE_BUCKET
+    # (MinIO). The service uploads the user-supplied file at creation time; the
+    # worker deletes it once the row reaches SUCCESS or FAILED.
+    file_storage_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Name of the column inside the uploaded file that holds the shared
     # production profile (the "injection").
-    injection_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    injection_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # CRM only. The sharing operation and the inclusive Brussels-local date
+    # range read out of meter_consumption. Plain columns, never FKs -- the CRM
+    # is a separate database.
+    id_sharing_operation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    period_start: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    period_end: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
 
     # --- Simulated key snapshot ---
     # The CRM ``allocation_key`` being stress-tested. Snapshotted by id (no FK:
@@ -55,6 +71,12 @@ class SimulationModel(LocalBase):
     # the worker writes on success. Null until SUCCESS. The API streams it back
     # for charting (GET /simulation/{id}/timeseries).
     result_storage_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    # Non-blocking findings from the CRM pre-flight -- currently the
+    # participants whose meter had gaps in the period and were zero-filled.
+    # Persisted rather than only shown before launch, so the manager can still
+    # see it on the finished run.
+    data_warnings: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     key_result: Mapped["SimulationKeyResultModel | None"] = relationship(
         "SimulationKeyResultModel",

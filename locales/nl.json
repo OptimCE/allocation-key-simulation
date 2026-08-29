@@ -20,7 +20,15 @@
       "DELETE_SIMULATION": "Verwijderen van de simulatie mislukt (code: 2107)",
       "RESULT_NOT_FOUND": "Simulatieresultaten niet gevonden (code: 2108)",
       "GET_TIMESERIES": "Ophalen van de tijdreeksen van de simulatie mislukt (code: 2109)",
-      "FILE_TOO_LARGE": "Het bestand overschrijdt de maximaal toegestane grootte (code: 2110)"
+      "FILE_TOO_LARGE": "Het bestand overschrijdt de maximaal toegestane grootte (code: 2110)",
+      "INVALID_PERIOD": "De begindatum moet op of vóór de einddatum liggen (code: 2111)",
+      "SHARING_OPERATION_NOT_FOUND": "Deeloperatie niet gevonden (code: 2112)",
+      "CRM_NO_DATA": "Geen meetgegevens voor deze deeloperatie in deze periode (code: 2113)",
+      "CRM_DUPLICATE_READINGS": "Dubbele meetwaarden gevonden: de gegevens zijn waarschijnlijk twee keer geïmporteerd (code: 2114)",
+      "CRM_NO_INJECTION": "Er is in deze periode niets geïnjecteerd, dus er valt niets te delen (code: 2115)",
+      "CRM_RANGE_TOO_LARGE": "De geselecteerde periode bevat te veel meetwaarden, kies een kortere periode (code: 2116)",
+      "KEY_CONSUMERS_NOT_MATCHED": "Sommige deelnemers van de sleutel komen met geen enkele meter (EAN) in deze periode overeen (code: 2117)",
+      "GET_CRM_PREVIEW": "De meetgegevens konden niet worden gecontroleerd (code: 2118)"
     }
   }
 }

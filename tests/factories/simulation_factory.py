@@ -54,12 +54,18 @@ async def create_crm_key(
     iterations: int = 1,
     consumers_per_iteration: int = 2,
     energy_allocated_percentage: float = 0.5,
+    consumer_names: list[str] | None = None,
 ) -> AllocationKeyModel:
     """Seed a CRM allocation_key tree (consumer names stable across iterations).
 
     The simulation API validates ``id_key`` against this CRM table, and the
     worker reads the tree from here.
+
+    ``consumer_names`` overrides the default ``C0``/``C1`` labels. CRM-sourced
+    runs need them to be meter EANs, since that is the (unenforced) convention
+    the platform matches ``consumer.name`` against.
     """
+    names = consumer_names or [f"C{j}" for j in range(consumers_per_iteration)]
     key = AllocationKeyModel(name=name, description=description, id_community=id_community)
     session.add(key)
     await session.flush()
@@ -72,10 +78,10 @@ async def create_crm_key(
         )
         session.add(iteration)
         await session.flush()
-        for j in range(consumers_per_iteration):
+        for consumer_name in names:
             session.add(
                 ConsumerModel(
-                    name=f"C{j}",
+                    name=consumer_name,
                     energy_allocated_percentage=energy_allocated_percentage,
                     id_iteration=iteration.id,
                     id_community=id_community,

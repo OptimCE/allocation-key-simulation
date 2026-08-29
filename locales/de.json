@@ -20,7 +20,15 @@
       "DELETE_SIMULATION": "Die Simulation konnte nicht gelöscht werden (Code: 2107)",
       "RESULT_NOT_FOUND": "Simulationsergebnisse nicht gefunden (Code: 2108)",
       "GET_TIMESERIES": "Zeitreihen der Simulation konnten nicht abgerufen werden (Code: 2109)",
-      "FILE_TOO_LARGE": "Die Datei überschreitet die maximal zulässige Größe (Code: 2110)"
+      "FILE_TOO_LARGE": "Die Datei überschreitet die maximal zulässige Größe (Code: 2110)",
+      "INVALID_PERIOD": "Das Startdatum muss vor oder auf dem Enddatum liegen (Code: 2111)",
+      "SHARING_OPERATION_NOT_FOUND": "Sharing-Vorgang nicht gefunden (Code: 2112)",
+      "CRM_NO_DATA": "Keine Messdaten für diesen Sharing-Vorgang in diesem Zeitraum (Code: 2113)",
+      "CRM_DUPLICATE_READINGS": "Doppelte Messwerte erkannt: die Daten wurden vermutlich zweimal importiert (Code: 2114)",
+      "CRM_NO_INJECTION": "In diesem Zeitraum wurde nichts eingespeist, es gibt also nichts zu teilen (Code: 2115)",
+      "CRM_RANGE_TOO_LARGE": "Der gewählte Zeitraum enthält zu viele Messwerte, bitte kürzen Sie ihn (Code: 2116)",
+      "KEY_CONSUMERS_NOT_MATCHED": "Einige Teilnehmer des Schlüssels stimmen mit keinem Zähler (EAN) in diesem Zeitraum überein (Code: 2117)",
+      "GET_CRM_PREVIEW": "Die Messdaten konnten nicht geprüft werden (Code: 2118)"
     }
   }
 }

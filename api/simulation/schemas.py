@@ -1,3 +1,5 @@
+import datetime
+
 from pydantic import BaseModel, Field
 
 from shared.const import SimulationStatus
@@ -107,3 +109,64 @@ class SimulateRequest(BaseModel):
 class SimulateResponse(BaseModel):
     id: int = Field(..., description="ID of the freshly created simulation row.")
     status: SimulationStatus = Field(..., description="Initial status (PENDING on success).")
+
+
+# ---------------------------------------------------------------------------
+# CRM-sourced simulation (source = DataSource.CRM)
+# ---------------------------------------------------------------------------
+
+
+class SimulateFromCrmRequest(BaseModel):
+    """Body of ``POST /from-crm``.
+
+    Unlike ``SimulateRequest`` this *is* the FastAPI body model: with no file
+    part there is nothing forcing multipart, so the request is plain JSON.
+
+    ``injection_name`` is deliberately absent — the production profile is summed
+    from the meters themselves, which is the whole reason this path is simpler
+    for the user than uploading a file.
+    """
+
+    name: str = Field(..., min_length=1, description="User-facing label for the simulation.")
+    id_key: int = Field(..., description="CRM allocation key id to stress-test.")
+    id_sharing_operation: int = Field(..., description="CRM sharing operation to read meters from.")
+    period_start: datetime.date = Field(..., description="First day of the period (inclusive).")
+    period_end: datetime.date = Field(..., description="Last day of the period (inclusive).")
+
+
+class IncompleteMeter(BaseModel):
+    """A participant's meter missing part of the period. Zero-filled, not fatal."""
+
+    ean: str
+    readings: int = Field(..., description="Distinct timestamps this meter actually has.")
+    expected: int = Field(..., description="Distinct timestamps across the whole operation.")
+    missing: int = Field(..., description="expected - readings.")
+
+
+class PreviewBlocker(BaseModel):
+    """A reason the period cannot be used, already localised."""
+
+    error_code: int = Field(..., description="Matches the error_code of the eventual 4xx.")
+    message: str = Field(..., description="Localised, manager-facing explanation.")
+    detail: str = Field(..., description="Which meters/participants triggered it.")
+
+
+class CrmDataPreview(BaseModel):
+    """What ``GET /crm-data-preview`` shows before the manager commits to a run.
+
+    ``matched`` / ``unmatched`` are the heart of it: the key's participant names
+    must be meter EANs, and this is where the manager finds out that they are
+    not, rather than after a failed run.
+    """
+
+    can_simulate: bool
+    matched_participants: list[str]
+    unmatched_participants: list[str]
+    meter_count: int = Field(..., description="Meters with readings in the period.")
+    reading_count: int
+    first_timestamp: datetime.datetime | None
+    last_timestamp: datetime.datetime | None
+    total_consumption_kwh: float
+    total_injection_kwh: float
+    incomplete_meters: list[IncompleteMeter]
+    blockers: list[PreviewBlocker]

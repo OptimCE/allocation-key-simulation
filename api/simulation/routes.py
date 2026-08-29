@@ -1,9 +1,13 @@
+from datetime import date
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.simulation.mappers import to_crm_data_preview
 from api.simulation.schemas import (
+    CrmDataPreview,
+    SimulateFromCrmRequest,
     SimulateRequest,
     SimulateResponse,
     Simulation,
@@ -12,7 +16,7 @@ from api.simulation.schemas import (
 )
 from api.simulation.service import SimulationService
 from core.api_response import ApiResponse, ApiResponsePaginated
-from core.context_vars import current_internal_community_id
+from core.context_vars import current_internal_community_id, current_locale
 from core.database.database import get_crm_session, get_local_session
 from core.errors.errors import ErrorException
 from core.errors.with_default_error import with_default_error
@@ -43,6 +47,37 @@ async def get_simulations(
     service = SimulationService(local_session, crm_session)
     data, pagination = await service.get_simulations(page, page_size, query_param)
     return ApiResponsePaginated[list[Simulation]](data=data, pagination=pagination)
+
+
+# GET (/crm-data-preview) : What the CRM holds for an operation + period, and
+# whether the key's participants match those meters.
+#
+# Declared BEFORE `GET /{id}`: FastAPI matches in declaration order, so putting
+# this after the integer catch-all would make "/crm-data-preview" try to parse
+# as an id and 422.
+@simulation_routes.get("/crm-data-preview", response_model=ApiResponse[CrmDataPreview])
+@with_default_error(default_error=errors.simulation.GET_CRM_PREVIEW)
+async def get_crm_data_preview(
+    local_session: Annotated[AsyncSession, Depends(get_local_session)],
+    crm_session: Annotated[AsyncSession, Depends(get_crm_session)],
+    id_key: Annotated[int, Query(description="CRM allocation key to be simulated.")],
+    id_sharing_operation: Annotated[int, Query(description="CRM sharing operation id.")],
+    period_start: Annotated[date, Query(description="First day of the period (inclusive).")],
+    period_end: Annotated[date, Query(description="Last day of the period (inclusive).")],
+):
+    internal_community_id = current_internal_community_id.get()
+    if internal_community_id is None:
+        raise ErrorException(error=errors.auth.UNAUTHORIZED, status_code=401)
+    service = SimulationService(local_session, crm_session)
+    preflight = await service.preview_crm_data(
+        id_key=id_key,
+        id_sharing_operation=id_sharing_operation,
+        period_start=period_start,
+        period_end=period_end,
+        community_id=internal_community_id,
+    )
+    locale = current_locale.get().split("_")[0]
+    return ApiResponse[CrmDataPreview](data=to_crm_data_preview(preflight, locale))
 
 
 # GET (/{id}) : One simulation with its scalar result tree.
@@ -92,6 +127,25 @@ async def start_simulation(
         raise ErrorException(error=errors.auth.UNAUTHORIZED, status_code=401)
     service = SimulationService(local_session, crm_session)
     data = await service.start_simulation(req, file, internal_community_id)
+    return ApiResponse[SimulateResponse](data=data)
+
+
+# POST (/from-crm) Simulate against CRM meter data
+#
+# Plain JSON, unlike POST / — with no file part nothing forces multipart. It
+# also correctly keeps the default 2 MB body cap rather than the upload one.
+@simulation_routes.post("/from-crm", response_model=ApiResponse[SimulateResponse])
+@with_default_error(default_error=errors.simulation.START_SIMULATION)
+async def start_simulation_from_crm(
+    body: Annotated[SimulateFromCrmRequest, Body()],
+    local_session: Annotated[AsyncSession, Depends(get_local_session)],
+    crm_session: Annotated[AsyncSession, Depends(get_crm_session)],
+):
+    internal_community_id = current_internal_community_id.get()
+    if internal_community_id is None:
+        raise ErrorException(error=errors.auth.UNAUTHORIZED, status_code=401)
+    service = SimulationService(local_session, crm_session)
+    data = await service.start_simulation_from_crm(body, internal_community_id)
     return ApiResponse[SimulateResponse](data=data)
 
 
