@@ -380,8 +380,9 @@ async def test_start_from_crm_body_is_json_not_query_params(client, db_session):
     op = await _operation_with_data(db_session, community)
     key = await create_crm_key(db_session, id_community=community.id, consumer_names=[_EAN_A])
 
-    with patch("api.simulation.service.get_jetstream", MagicMock()), patch(
-        "api.simulation.service.send_event", new_callable=AsyncMock
+    with (
+        patch("api.simulation.service.get_jetstream", MagicMock()),
+        patch("api.simulation.service.send_event", new_callable=AsyncMock),
     ):
         response = await client.post(
             "/from-crm", json=_body(key.id, op), headers=_admin_headers(community)

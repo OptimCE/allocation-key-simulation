@@ -199,7 +199,6 @@ async def save_success(simulation_id: int, result: KeySimResult) -> None:
     )
 
 
-
 async def save_failure(simulation_id: int, error_message: str) -> None:
     """Mark a simulation FAILED with the given message (idempotent)."""
     async with AsyncSessionLocalFactory() as session:
@@ -248,4 +247,3 @@ async def save_failure(simulation_id: int, error_message: str) -> None:
         scope_community_id=id_community,
         hint={"status": "failed"},
     )
-

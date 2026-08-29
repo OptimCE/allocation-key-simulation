@@ -93,8 +93,9 @@ def test_injection_only_meter_can_be_a_participant():
 def test_participant_order_follows_the_key_not_the_database():
     # Matrix rows are built in this order and must line up with the key.
     result = evaluate(
-        _summary([_coverage(_B), _coverage(_A), _coverage(_PV, consumption_kwh=0.0,
-                                                          injection_kwh=50.0)]),
+        _summary(
+            [_coverage(_B), _coverage(_A), _coverage(_PV, consumption_kwh=0.0, injection_kwh=50.0)]
+        ),
         [_B, _A],
     )
     assert result.participants == [_B, _A]
@@ -118,8 +119,12 @@ def test_empty_period_blocks_with_a_single_message():
 
 def test_duplicate_readings_block():
     result = evaluate(
-        _summary([_coverage(_A, row_count=8, distinct_ts=4),
-                  _coverage(_PV, consumption_kwh=0.0, injection_kwh=50.0)]),
+        _summary(
+            [
+                _coverage(_A, row_count=8, distinct_ts=4),
+                _coverage(_PV, consumption_kwh=0.0, injection_kwh=50.0),
+            ]
+        ),
         [_A],
     )
     assert errors.simulation.CRM_DUPLICATE_READINGS.code in _codes(result)

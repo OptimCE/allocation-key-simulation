@@ -148,9 +148,7 @@ def test_frame_feeds_the_existing_simulation_converter_unchanged():
     participants = ["541448000000000001", "541448000000000002"]
 
     frame = crm_timeseries.build_dataframe(rows, participants)
-    raw = data_loading.to_simulation_raw_data(
-        frame, crm_timeseries.INJECTION_COLUMN, participants
-    )
+    raw = data_loading.to_simulation_raw_data(frame, crm_timeseries.INJECTION_COLUMN, participants)
 
     assert raw.consumer_names == participants
     assert raw.C.shape == (2, 2)
