@@ -8,7 +8,7 @@ on:
     paths:
       - 'Dockerfile.worker'
       - 'core/**'
-      - 'algorithms/**'
+      - 'simulation/**'
       - 'shared/**'
       - 'worker/**'
       - 'locales/**'
@@ -21,7 +21,7 @@ on:
     paths:
       - 'Dockerfile.worker'
       - 'core/**'
-      - 'algorithms/**'
+      - 'simulation/**'
       - 'shared/**'
       - 'worker/**'
       - 'locales/**'
