@@ -28,7 +28,9 @@
       "CRM_NO_INJECTION": "No energy was injected over this period, so there is nothing to share (code: 2115)",
       "CRM_RANGE_TOO_LARGE": "The selected period holds too many readings, please shorten it (code: 2116)",
       "KEY_CONSUMERS_NOT_MATCHED": "Some of the key's participants match no meter (EAN) over this period (code: 2117)",
-      "GET_CRM_PREVIEW": "The metering data could not be checked (code: 2118)"
+      "GET_CRM_PREVIEW": "The metering data could not be checked (code: 2118)",
+      "SIMULATION_TOO_LARGE": "Too much data for a single simulation (participants × timesteps × iterations), please shorten the period or simulate a key with fewer participants or iterations (code: 2119)",
+      "TIMESERIES_TOO_LARGE": "The time series of this simulation are too large to be sent in full (code: 2120)"
     }
   }
 }

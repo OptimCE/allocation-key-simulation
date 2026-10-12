@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import select
 
 from core.database.models import Community
+from shared import problem_size
 from shared.const import DataSource, SimulationStatus
 from shared.custom_errors import errors
 from shared.models.local_models import SimulationModel
@@ -351,6 +352,59 @@ async def test_start_from_crm_refuses_duplicate_readings(send_event, client, db_
     assert response.status_code == 422
     assert response.json()["error_code"] == errors.simulation.CRM_DUPLICATE_READINGS.code
     send_event.assert_not_awaited()
+
+
+async def test_preview_blocks_a_run_too_large_for_the_keys_iterations(
+    client, db_session, monkeypatch
+):
+    # 1 participant x 4 instants: 4 cells per iteration. Over a limit of 11, one
+    # iteration fits and three do not, over the very same period.
+    monkeypatch.setattr(problem_size, "MAX_SIMULATION_CELLS", 11)
+    community = await _community_with_subscription(db_session)
+    op = await _operation_with_data(db_session, community)
+    one = await create_crm_key(db_session, id_community=community.id, consumer_names=[_EAN_A])
+    three = await create_crm_key(
+        db_session, id_community=community.id, consumer_names=[_EAN_A], iterations=3
+    )
+
+    def preview(key):
+        return client.get(
+            "/crm-data-preview",
+            params={"id_key": key.id, "id_sharing_operation": op, **_PERIOD},
+            headers=_admin_headers(community),
+        )
+
+    assert (await preview(one)).json()["data"]["can_simulate"] is True
+    data = (await preview(three)).json()["data"]
+    assert data["can_simulate"] is False
+    assert [b["error_code"] for b in data["blockers"]] == [
+        errors.simulation.SIMULATION_TOO_LARGE.code
+    ]
+
+
+@patch("api.simulation.service.get_jetstream", MagicMock())
+@patch("api.simulation.service.send_event", new_callable=AsyncMock)
+async def test_start_from_crm_refuses_a_run_too_large(send_event, client, db_session, monkeypatch):
+    monkeypatch.setattr(problem_size, "MAX_SIMULATION_CELLS", 11)
+    community = await _community_with_subscription(db_session)
+    op = await _operation_with_data(db_session, community)
+    key = await create_crm_key(
+        db_session, id_community=community.id, consumer_names=[_EAN_A], iterations=3
+    )
+
+    response = await client.post(
+        "/from-crm", json=_body(key.id, op), headers=_admin_headers(community)
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error_code"] == errors.simulation.SIMULATION_TOO_LARGE.code
+    send_event.assert_not_awaited()
+    rows = (
+        await db_session.execute(
+            select(SimulationModel).where(SimulationModel.id_community == community.id)
+        )
+    ).all()
+    assert rows == []
 
 
 @patch("api.simulation.service.get_jetstream", MagicMock())

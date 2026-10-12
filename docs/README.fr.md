@@ -55,7 +55,10 @@ Une exécution traverse le système ainsi :
    `PENDING` et publie un événement `optimce.simulation.run`.
 3. Le worker prend la tâche, associe les colonnes du fichier aux consommateurs
    de la clé par leur nom, et exécute le solveur (`simulation/compute.py`, une
-   fonction pure) en dehors de la boucle d'événements.
+   fonction pure) en dehors de la boucle d'événements. Chaque cellule de ces
+   colonnes et de la colonne d'injection doit contenir un nombre : une cellule
+   vide fait échouer l'exécution (`parse_failed`, avec la colonne et sa première
+   ligne de données concernée).
 4. Les totaux scalaires sont écrits dans la base locale ; la série par pas de
    temps est téléversée comme objet JSON. L'exécution est marquée `SUCCESS` (ou
    `FAILED`).
@@ -84,7 +87,7 @@ relatifs :
 |---|---|---|
 | `GET` | `/` | Lister les simulations (paginées) avec leur statut |
 | `GET` | `/{id}` | Obtenir une simulation avec son arbre de résultats scalaires |
-| `GET` | `/{id}/timeseries` | Obtenir la série de résultats par pas de temps pour les graphiques |
+| `GET` | `/{id}/timeseries` | Obtenir la série de résultats par pas de temps ; `?max_points=N` pour un graphique (séries propres à chaque itération, échantillonnées) |
 | `POST` | `/` | Démarrer une simulation (`multipart/form-data` : `file`, `name`, `id_key`, `injection_name`) |
 | `DELETE` | `/{id}` | Supprimer une simulation et ses résultats stockés |
 
@@ -168,6 +171,63 @@ chaque variable. Les principaux groupes sont :
   `LOGGING_METRICS_URL`)
 - **Sélecteur d'environnement** (`ENV` : `local`, `test`, `staging`,
   `production`)
+
+## Dimensionnement des ressources
+
+Le worker calcule dans un pool de processus, un par CPU attribué moins un (les
+fichiers compose lui donnent 2 CPU, d'où un processus de calcul). Le coût d'une
+simulation croît avec son nombre de **cellules** : participants × pas de temps ×
+itérations. Son résultat contient cinq valeurs par cellule ; une série au quart
+d'heure compte 96 pas de temps par jour.
+
+Mesures dans l'image du worker avec 2 CPU, à la limite ci-dessous :
+
+| Entrée | Cellules | Processus principal | Processus de calcul | Conteneur¹ |
+|---|---|---|---|---|
+| CRM, 142 compteurs × un an, 1 itération | 4 975 680 | 1,25 Go | 1,46 Go | 1,92 Go |
+| CRM, même période, 47 des compteurs, 3 itérations | 4 940 640 | 1,25 Go | 1,23 Go | 1,85 Go |
+| CSV de 50 Mo (240 compteurs × un an), 142 d'entre eux, 1 itération | 4 975 680 | 0,40 Go | 1,46 Go | 1,70 Go |
+| même fichier, 47 des compteurs, 3 itérations | 4 940 640 | 0,36 Go | 1,23 Go | 1,69 Go |
+
+¹ Y compris le cache de pages du fichier de résultat, de 350 à 400 Mo, que le
+noyau peut récupérer. Chaque exécution a pris moins de 70 secondes.
+
+- **Limite.** Une simulation de plus de **5 000 000** cellules est refusée avec
+  l'erreur 2119 : par l'aperçu CRM et `POST /from-crm` (avec les autres
+  blocages, avant toute lecture des relevés), par `POST /` pour un fichier
+  envoyé (compté d'après ses lignes), puis par le worker sur les données
+  analysées. Cela représente 142 compteurs sur un an avec une itération, ou 47
+  compteurs avec trois. La valeur se trouve dans `shared/problem_size.py` ; ne
+  l'augmentez qu'en même temps que la mémoire du worker. La lecture CRM reste
+  elle-même plafonnée à 5 000 000 relevés (erreur 2116).
+- **Où va la mémoire.** Le processus principal du worker porte l'entrée : la
+  lecture CRM et son pivot, jusqu'à 1,25 Go pour 5 000 000 relevés, ou le
+  fichier analysé. Le processus de calcul porte le résultat. Il écrit les séries
+  par pas de temps dans un fichier JSON temporaire et ne renvoie que les totaux,
+  et le processus principal transmet ce fichier en flux vers le stockage objet :
+  le résultat ne passe jamais par lui.
+- **Mémoire du conteneur.** Les fichiers compose du monorepo et de production
+  fixent `mem_limit: 2560m`, avec le swap plafonné à la même valeur. Chaque
+  processus de calcul se désigne comme premier choix du noyau quand le conteneur
+  manque de mémoire (`oom_score_adj` 1000) : le calcul échoue et est retenté,
+  alors qu'un processus principal tué arrêterait tout le worker et son message
+  reviendrait sans limite de livraisons. Ce dimensionnement suppose que le
+  `max_ack_pending` du consommateur vaut le nombre de processus de calcul, comme
+  le worker le règle, afin qu'aucune autre entrée ne soit lue pendant un calcul.
+- **Plantages du calcul.** Un processus de calcul tué faute de mémoire (ou qui
+  plante) casse tout le pool. Chaque simulation en cours de calcul est livrée à
+  nouveau ; un plantage à sa troisième livraison ou au-delà la marque en échec
+  avec `solver_crashed (likely out of memory)`.
+- **Relire un résultat.** `GET /{id}/timeseries` transmet l'objet stocké sans
+  l'analyser, avec environ 20 Mo de mémoire de l'API quelle que soit sa taille,
+  et refuse un objet de plus de 64 Mio (environ 750 000 cellules) avec l'erreur
+  2120 : la passerelle décode une réponse JSON en entier, avec environ 10 octets
+  de sa mémoire par octet. Un graphique demande plutôt `?max_points=N` : les
+  séries propres à chaque itération, un pas de temps sur `stride` (indiqué dans
+  la réponse), sans les séries par consommateur. À la limite, cela lit l'objet
+  de 430 Mo en moins d'une seconde et répond quelques centaines de ko. Analyser
+  puis resérialiser l'objet, comme le faisait l'API, prenait environ 470 octets
+  de mémoire de l'API par cellule : 2,4 Go à la limite.
 
 ## Tests
 

@@ -1,9 +1,11 @@
 import datetime
 import logging
+from collections.abc import AsyncIterator
 from uuid import uuid4
 
 from fastapi import UploadFile
 
+from api.simulation import timeseries_reader, upload_shape
 from api.simulation.mappers import to_simulation_detail, to_simulation_schema
 from api.simulation.repository import SimulationRepository
 from api.simulation.schemas import (
@@ -23,7 +25,7 @@ from core.errors.errors import ErrorException
 from core.middleware.request_limits import UPLOAD_MAX_BODY_BYTES
 from core.queue.helper import Event, send_event
 from core.queue.init import get_jetstream
-from shared import crm_preflight
+from shared import crm_preflight, problem_size
 from shared.const import SIMULATION_SUBJECT, DataSource, SimulationStatus
 from shared.crm_meter_repository import CrmMeterRepository
 from shared.crm_preflight import Preflight
@@ -39,6 +41,15 @@ logger = logging.getLogger(__name__)
 
 # Read the upload in bounded chunks instead of one unbounded ``file.read()``.
 _UPLOAD_READ_CHUNK_BYTES = 1024 * 1024  # 1 MB
+
+# The largest stored time-series object GET /{id}/timeseries sends whole: 64 MiB,
+# about 750,000 participant x timestep x iteration cells. The API streams it in
+# 1 MB, but the gateway (KrakenD, encoding "json") decodes the whole response:
+# about 10 bytes of gateway memory per byte (measured, krakend 2.13.11: 816 MB
+# for 81 MB), with no memory limit in production. Answering in under 3 s, the
+# gateway's timeout, is what used to stop larger ones, as a 500. A chart asks
+# with max_points, a few hundred kB whatever the run.
+FULL_TIMESERIES_MAX_BYTES = 64 * 1024 * 1024
 
 
 async def _read_within_cap(file: UploadFile, max_bytes: int) -> bytes:
@@ -88,17 +99,52 @@ class SimulationService:
             raise ErrorException(error=errors.simulation.SIMULATION_NOT_FOUND, status_code=404)
         return to_simulation_detail(sim)
 
-    async def get_timeseries(self, id: int) -> SimulationTimeseries:
+    async def stream_timeseries(self, id: int) -> AsyncIterator[bytes]:
+        """The stored time-series object as an ``ApiResponse``, chunk by chunk.
+
+        Neither parsed nor held whole (``timeseries_reader.as_api_response``):
+        reading it into ``SimulationTimeseries`` cost about 460 bytes of memory
+        per cell. Storage is opened before this returns, so a missing object
+        still answers 404, and one over ``FULL_TIMESERIES_MAX_BYTES`` 422,
+        before anything is sent.
+        """
+        chunks = storage.iter_object(
+            await self._result_storage_key(id), max_bytes=FULL_TIMESERIES_MAX_BYTES
+        )
+        try:
+            first = await anext(chunks)
+        except storage.ObjectNotFound as exc:
+            raise ErrorException(error=errors.simulation.RESULT_NOT_FOUND, status_code=404) from exc
+        except storage.ObjectTooLarge as exc:
+            logger.info("Time series of simulation %d not sent whole: %s", id, exc)
+            raise ErrorException(
+                error=errors.simulation.TIMESERIES_TOO_LARGE, status_code=422
+            ) from exc
+        return timeseries_reader.as_api_response(_prepend(first, chunks))
+
+    async def sample_timeseries(self, id: int, max_points: int) -> SimulationTimeseries:
+        """Each iteration's own series, at most ``max_points`` values each, for a chart.
+
+        The per-consumer series, nearly all of the stored object, are skipped as
+        it streams in (``timeseries_reader.read_iterations``).
+        """
+        key = await self._result_storage_key(id)
+        try:
+            iterations, stride = await timeseries_reader.read_iterations(
+                storage.iter_object(key), max_points
+            )
+        except storage.ObjectNotFound as exc:
+            raise ErrorException(error=errors.simulation.RESULT_NOT_FOUND, status_code=404) from exc
+        return SimulationTimeseries(iterations=iterations, stride=stride)
+
+    async def _result_storage_key(self, id: int) -> str:
         sim = await self.repository.get_simulation_row(id)
         if not sim:
             raise ErrorException(error=errors.simulation.SIMULATION_NOT_FOUND, status_code=404)
-        if not sim.result_storage_key:
+        key: str | None = sim.result_storage_key
+        if not key:
             raise ErrorException(error=errors.simulation.RESULT_NOT_FOUND, status_code=404)
-        try:
-            content = await storage.download(sim.result_storage_key)
-        except storage.ObjectNotFound as exc:
-            raise ErrorException(error=errors.simulation.RESULT_NOT_FOUND, status_code=404) from exc
-        return SimulationTimeseries.model_validate_json(content)
+        return key
 
     # ------------------------------------------------------------------
     # CRM-sourced simulation
@@ -142,7 +188,10 @@ class SimulationService:
             period_start=period_start,
             period_end=period_end,
         )
-        return crm_preflight.evaluate(summary, consumer_names_of(from_crm_allocation_key(key)))
+        key_input = from_crm_allocation_key(key)
+        return crm_preflight.evaluate(
+            summary, consumer_names_of(key_input), iterations=len(key_input.iterations)
+        )
 
     async def start_simulation_from_crm(
         self, req: SimulateFromCrmRequest, community_id: int
@@ -245,6 +294,22 @@ class SimulationService:
         if not content:
             raise ErrorException(error=errors.simulation.INVALID_FILE, status_code=422)
         file_name = file.filename or "uploaded-file"
+
+        # 2b. Refuse a run too large to produce before storing and queueing the
+        # file. The key gives the participants (other columns are ignored) and
+        # the iterations; the file's data rows are the timesteps. The count errs
+        # high, and a file it cannot read goes through to the worker, which
+        # re-checks the parsed matrix.
+        shape = upload_shape.measure(content, file_name)
+        if shape is not None:
+            _columns, data_rows = shape
+            key_input = from_crm_allocation_key(key)
+            oversize = problem_size.too_large(
+                len(consumer_names_of(key_input)), data_rows, len(key_input.iterations)
+            )
+            if oversize:
+                logger.info("Upload refused for community %d: %s", community_id, oversize)
+                raise ErrorException(error=errors.simulation.SIMULATION_TOO_LARGE, status_code=422)
 
         # 3. Upload to MinIO. community_id keeps keys browsable per tenant; the
         # UUID guarantees no collisions when two requests reuse a filename.
@@ -361,3 +426,9 @@ class SimulationService:
 async def _best_effort_delete(storage_key: str) -> None:
     """Wrap ``storage.delete`` for rollback/cleanup paths (already idempotent)."""
     await storage.delete(storage_key)
+
+
+async def _prepend(first: bytes, rest: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    yield first
+    async for chunk in rest:
+        yield chunk

@@ -6,15 +6,47 @@ group of the same name; multiple worker replicas share work via JetStream.
 Message handling follows a strict failure-class matrix:
 
 * **Deterministic failures** (object missing, key deleted, bad file, bad
-  consumer columns, compute error) — mark the simulation row FAILED with an
-  error message and ack the message. JetStream must not redeliver a poison
-  pill that will fail the same way every time.
+  consumer columns, run too large, compute error) — mark the simulation row
+  FAILED with an error message and ack the message. JetStream must not
+  redeliver a poison pill that will fail the same way every time.
 * **Transient failures** (storage 5xx/timeout, CRM/local DB hiccup, result
   upload failure) — nak the message so JetStream redelivers, leaving the row
   PENDING.
+* **Solver crashes** (a solver pool process died: OOM kill, native crash)
+  — nak while the message's delivery count is below
+  ``_MAX_SOLVER_CRASH_DELIVERIES``, then mark the row FAILED
+  (``solver_crashed``) and ack. A crash breaks the whole pool, so with more
+  than one solver process the simulations solving beside the one that caused
+  it see it too and are retried as well. A crash that is deterministic (input
+  too large for the container) repeats on every delivery and must not loop
+  forever.
+
+Long runs
+---------
+A simulation can outlast the consumer's ack_wait: it may first wait for a
+solver slot (the semaphore is shared by every message the worker holds), and
+the largest inputs (5 M CRM readings) take about a minute to read, solve and
+store. While ``_process`` works, the handler sends JetStream an in-progress ack
+every ``_IN_PROGRESS_INTERVAL_SECONDS``, which restarts the message's ack_wait
+clock. The message is redelivered only once those stop: the worker died, lost
+NATS, or cancelled the simulation on shutdown.
 
 The dispatcher never holds a DB session while running the computation — each
 step opens its own short-lived session.
+
+Memory
+------
+This process must not be the one that runs out of memory: its death takes the
+whole worker down, the in-progress acks stop, and the message comes back after
+ack_wait with nothing counting how often (``_MAX_SOLVER_CRASH_DELIVERIES``
+counts only solver crashes). So the run's size is checked before the solve
+(``shared.problem_size``), and its result, whose per-timestep series dominate,
+never comes back here whole: the solver process writes the series to a JSON
+file (``worker.timeseries``), returns the totals, and ``persistence`` streams
+the file to storage. What grows here is the input: the CRM read (bounded by
+``crm_preflight.MAX_READING_ROWS``) or the parsed upload (bounded by the upload
+size limit). The solver processes volunteer as the kernel's first victim when
+the container runs out (``worker.main._init_solver_process``).
 
 File-storage cleanup runs only on terminal outcomes (SUCCESS, deterministic
 FAILURE), never on transient NAKs (the next delivery still needs the file).
@@ -23,11 +55,12 @@ FAILURE), never on transient NAKs (the next delivery still needs the file).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import datetime
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import BrokenExecutor, Executor
 
 from nats.aio.msg import Msg
@@ -37,8 +70,8 @@ from nats.js.api import ConsumerConfig
 from core import metrics as app_metrics
 from core import storage
 from core.database.database import AsyncSessionCRMFactory, AsyncSessionLocalFactory
-from core.queue.helper import Event
-from shared import crm_preflight, crm_timeseries, data_loading
+from core.queue.helper import Event, subscribe_durable
+from shared import crm_preflight, crm_timeseries, data_loading, problem_size
 from shared.const import SIMULATION_SUBJECT, DataSource, SimulationStatus
 from shared.crm_meter_repository import CrmMeterRepository
 from shared.crm_repository import CRMRepository
@@ -51,19 +84,36 @@ from simulation.inputs import (
 )
 from simulation.key_mapping import consumer_names_of, from_crm_allocation_key
 from simulation.result import KeySimResult
-from worker import persistence
+from worker import persistence, timeseries
 
 logger = logging.getLogger(__name__)
 
-# The solve runs off-loop in a process pool and several solves share the
-# available cores, so an individual solve's wall-clock can stretch under load.
-# 10 minutes gives generous headroom against redelivering a still-running solve.
-# JetStream will not redeliver until ack_wait elapses, so this also caps how
-# long a silent crash stalls the queue.
+# JetStream redelivers a message that is neither acked nor marked in progress
+# within this window. The handler keeps resetting it with in-progress acks
+# (``_IN_PROGRESS_INTERVAL_SECONDS``), so what it still bounds is how long a
+# simulation whose worker died or lost NATS waits before another delivery.
+# Like max_ack_pending, it only applies when the durable is created: nats-py
+# reuses an existing consumer's config as is, so a consumer created before
+# this was raised from 2 minutes (the dev one, from 2026-06-05) still
+# redelivers after 120 s.
 _ACK_WAIT_SECONDS = 10 * 60
+
+# How often a simulation still being processed sends an in-progress ack. Well
+# under even the 2-minute ack_wait of older consumers, so a few lost or late
+# acks never let it lapse. Late ones happen: pivoting the largest CRM reads
+# holds the event loop for about 9 s.
+_IN_PROGRESS_INTERVAL_SECONDS = 20
 
 # How long JetStream waits before redelivering after a NAK.
 _NAK_RETRY_DELAY_SECONDS = 30
+
+# The delivery on which a solver crash stops being retried and the simulation
+# is marked FAILED. Counts every delivery of the message, including ones that
+# ended for another reason (a storage NAK, an expired ack_wait). Small, because
+# a deterministic crash costs a full run each time; above 1, because the crash
+# may have come from another simulation sharing the pool, or from memory
+# pressure that has since passed.
+_MAX_SOLVER_CRASH_DELIVERIES = 3
 
 _DURABLE = "worker-simulation"
 
@@ -94,11 +144,33 @@ class _Terminal:
     storage_key: str | None
 
 
+@dataclasses.dataclass(frozen=True)
+class _Solved:
+    """What a solve hands back to this process.
+
+    ``result`` has its totals but no per-timestep series
+    (``timeseries.without_series``); those are in the JSON file at
+    ``timeseries_path``, which ``_process`` deletes once they are stored.
+    """
+
+    result: KeySimResult
+    timeseries_path: str
+
+
 class _TransientError(Exception):
     """Raised inside ``_process`` to signal the message should be NAK'd.
 
     Raised (not returned) so the handler leaves the file in place for the
     redelivered message.
+    """
+
+
+class _SolverCrashError(Exception):
+    """Raised by ``_run_simulation`` when a solver pool process died mid-solve.
+
+    The pool reports that as ``BrokenExecutor`` (``BrokenProcessPool``),
+    typically the kernel's OOM killer or a native crash. ``_process`` decides
+    from the delivery count whether it is retried.
     """
 
 
@@ -120,15 +192,17 @@ async def subscribe(
 
     ``max_ack_pending`` caps how many messages JetStream delivers before we ack,
     so the broker never hands us more than the pool can actively solve.
+
+    ``subscribe_durable`` writes ``ack_wait`` and ``max_ack_pending`` onto a
+    durable an earlier build created, which ``js.subscribe`` alone does not.
     """
     config_kwargs: dict = {"ack_wait": _ACK_WAIT_SECONDS}
     if max_ack_pending is not None:
         config_kwargs["max_ack_pending"] = max_ack_pending
-    sub = await js.subscribe(
+    sub = await subscribe_durable(
+        js,
         subject=SIMULATION_SUBJECT,
         durable=_DURABLE,
-        queue=_DURABLE,
-        manual_ack=True,
         cb=_make_handler(executor=executor, semaphore=semaphore, inflight=inflight),
         config=ConsumerConfig(**config_kwargs),
     )
@@ -197,7 +271,8 @@ async def _handle_message(
         return
 
     try:
-        outcome = await _process(simulation_id, msg, executor=executor, semaphore=semaphore)
+        async with _in_progress_until_done(msg, simulation_id):
+            outcome = await _process(simulation_id, msg, executor=executor, semaphore=semaphore)
     except _TransientError as exc:
         logger.warning(
             "Transient failure for simulation %d, will redeliver: %s", simulation_id, exc
@@ -220,18 +295,71 @@ async def _handle_message(
     app_metrics.worker_messages.add(1, {"outcome": "ack"})
 
 
+@contextlib.asynccontextmanager
+async def _in_progress_until_done(msg: Msg, simulation_id: int) -> AsyncIterator[None]:
+    """Keep JetStream from redelivering ``msg`` while the block runs.
+
+    Covers all of ``_process``, not only the solve: waiting for a solver slot
+    can also outlast ack_wait (the semaphore is shared by every message the
+    worker holds), and a redelivered copy would become a second task that runs
+    the whole simulation again. Stops on any exit, normal, raised or cancelled
+    (the shutdown drain), before the handler acks or naks.
+    """
+    heartbeat = asyncio.create_task(_send_in_progress(msg, simulation_id))
+    try:
+        yield
+    finally:
+        heartbeat.cancel()
+        # Wait for it to stop, so no in-progress ack follows the ack or nak.
+        # asyncio.wait neither raises the heartbeat's CancelledError nor
+        # swallows a cancellation of this task.
+        await asyncio.wait({heartbeat})
+
+
+async def _send_in_progress(msg: Msg, simulation_id: int) -> None:
+    """Send an in-progress ack every ``_IN_PROGRESS_INTERVAL_SECONDS``, forever."""
+    while True:
+        await asyncio.sleep(_IN_PROGRESS_INTERVAL_SECONDS)
+        try:
+            await msg.in_progress()
+        except Exception as exc:
+            # Not worth failing the simulation over: the next one may get
+            # through, and if none do, the message is redelivered after
+            # ack_wait as if it had no heartbeat.
+            logger.warning("In-progress ack for simulation %d failed: %s", simulation_id, exc)
+
+
+def _delivery_count(msg: Msg) -> int | None:
+    """JetStream's delivery count for ``msg`` (1 on the first delivery), or None."""
+    try:
+        return int(msg.metadata.num_delivered)
+    except Exception:
+        return None
+
+
 def _run_simulation_subprocess(
     key: SimulationKeyInput, raw: data_loading.SimulationRawData
-) -> KeySimResult:
+) -> _Solved:
     """Top-level, picklable entry executed inside a solver pool process.
 
     The pool initializer (``worker.main._init_solver_process``) has already
     imported ``simulation.compute`` in this process. ``run_simulation`` is pure
     synchronous CPU work, so there is nothing async to drive here. ``key``
-    (pydantic), ``raw`` (numpy arrays + names) and the ``KeySimResult`` are all
-    picklable, so they cross the process boundary cleanly.
+    (pydantic), ``raw`` (numpy arrays + names) and the returned ``_Solved`` are
+    all picklable, so they cross the process boundary cleanly.
+
+    The per-timestep series are written to a JSON file here, in the solver
+    process, and only the totals go back: as Python floats the series take 160
+    bytes per participant, timestep and iteration, and would otherwise be
+    pickled here and rebuilt in the main process.
     """
-    return run_simulation(key, raw.C, raw.VA, raw.consumer_names)
+    result = run_simulation(key, raw.C, raw.VA, raw.consumer_names)
+    path = timeseries.to_temp_file(result)
+    try:
+        return _Solved(result=timeseries.without_series(result), timeseries_path=path)
+    except BaseException:
+        timeseries.remove(path)
+        raise
 
 
 async def _run_simulation(
@@ -240,7 +368,7 @@ async def _run_simulation(
     *,
     executor: Executor | None,
     semaphore: asyncio.Semaphore | None,
-) -> KeySimResult:
+) -> _Solved:
     """Run the solve, off the event loop when a process pool is configured.
 
     With ``executor`` set, the CPU-bound solve runs in a separate process so the
@@ -251,7 +379,7 @@ async def _run_simulation(
     use.
     """
     if executor is None:
-        return run_simulation(key, raw.C, raw.VA, raw.consumer_names)
+        return _run_simulation_subprocess(key, raw)
     loop = asyncio.get_running_loop()
     try:
         if semaphore is None:
@@ -259,11 +387,12 @@ async def _run_simulation(
         async with semaphore:
             return await loop.run_in_executor(executor, _run_simulation_subprocess, key, raw)
     except BrokenExecutor as exc:
-        # A pool worker died abnormally (OOM, native crash). Treat as transient —
-        # redeliver rather than wrongly mark this simulation FAILED. The pool
-        # rebuilds itself on the next submit (see worker.main._SolverPool), so the
-        # redelivery lands on a fresh worker.
-        raise _TransientError(f"solver pool broken: {exc}") from exc
+        # A pool worker died abnormally (OOM kill, native crash). That breaks the
+        # whole pool, so every solve running in it lands here, not only the one
+        # that crashed. The pool rebuilds itself on the next submit (see
+        # worker.main._SolverPool); whether this simulation gets that next
+        # submit is _after_solver_crash's call.
+        raise _SolverCrashError(str(exc)) from exc
 
 
 async def _process(
@@ -316,21 +445,32 @@ async def _process(
     # ---- Step 3: obtain the (C, VA, names) triple ----------------------
     # Two sources, one output. Everything downstream is identical.
     if snapshot.source is DataSource.CRM:
-        loaded = await _load_from_crm(snapshot, consumer_names)
+        loaded = await _load_from_crm(
+            snapshot, consumer_names, iterations=len(key_input.iterations)
+        )
     else:
         loaded = await _load_from_file(snapshot, consumer_names)
     if isinstance(loaded, _Terminal):
         return loaded
     raw = loaded
 
+    # ---- Step 4: refuse a run too large to produce ---------------------
+    # The CRM pre-flight and the upload route check this before queueing, but
+    # the upload count is approximate (and skipped for a file it cannot read).
+    # This is the exact parsed shape, checked before any solver memory is spent.
+    num_participants, num_timesteps = raw.C.shape
+    oversize = problem_size.too_large(num_participants, num_timesteps, len(key_input.iterations))
+    if oversize:
+        await persistence.save_failure(simulation_id, f"simulation_too_large: {oversize}")
+        return _Terminal(storage_key=snapshot.file_storage_key)
+
     # ---- Step 5: run the simulation off the event loop ----------------
     start = time.perf_counter()
     try:
-        result = await _run_simulation(key_input, raw, executor=executor, semaphore=semaphore)
-    except _TransientError:
-        # Broken solver pool (a worker died). Redeliver — don't mark FAILED.
+        solved = await _run_simulation(key_input, raw, executor=executor, semaphore=semaphore)
+    except _SolverCrashError as exc:
         app_metrics.simulation_duration.record(time.perf_counter() - start, {"status": "failed"})
-        raise
+        return await _after_solver_crash(simulation_id, msg, exc, snapshot.file_storage_key)
     except SimulationInputError as exc:
         app_metrics.simulation_duration.record(time.perf_counter() - start, {"status": "failed"})
         await persistence.save_failure(simulation_id, f"simulation_failed: {exc}")
@@ -344,14 +484,46 @@ async def _process(
 
     # ---- Step 6: persist the result ------------------------------------
     try:
-        await persistence.save_success(simulation_id, result)
+        await persistence.save_success(simulation_id, solved.result, solved.timeseries_path)
     except Exception as exc:
         # DB/storage failures during persist are transient — redeliver. Do NOT
         # delete the source file here.
         raise _TransientError(f"persist failed: {exc}") from exc
+    finally:
+        # A redelivery solves again and writes a new file.
+        timeseries.remove(solved.timeseries_path)
 
     logger.info("Simulation %d processed successfully", simulation_id)
     return _Terminal(storage_key=snapshot.file_storage_key)
+
+
+async def _after_solver_crash(
+    simulation_id: int, msg: Msg, exc: _SolverCrashError, storage_key: str | None
+) -> _Terminal:
+    """Retry a solver crash on a later delivery, up to a point.
+
+    Raises ``_TransientError`` (NAK) while the delivery count is below
+    ``_MAX_SOLVER_CRASH_DELIVERIES``: the crash may have come from another
+    simulation sharing the pool, or from memory pressure that has passed.
+    From that delivery on (or when the count cannot be read, so a crash can
+    never loop) the simulation is marked FAILED and its file released.
+    """
+    delivered = _delivery_count(msg)
+    if delivered is not None and delivered < _MAX_SOLVER_CRASH_DELIVERIES:
+        raise _TransientError(
+            f"solver crashed on delivery {delivered} of {_MAX_SOLVER_CRASH_DELIVERIES}: {exc}"
+        ) from exc
+    delivery = "unknown" if delivered is None else str(delivered)
+    logger.error(
+        "Solver crashed for simulation %d on delivery %s; not retrying: %s",
+        simulation_id,
+        delivery,
+        exc,
+    )
+    await persistence.save_failure(
+        simulation_id, f"solver_crashed (likely out of memory) on delivery {delivery}: {exc}"
+    )
+    return _Terminal(storage_key=storage_key)
 
 
 def _with_trimmed_participants(key: SimulationKeyInput) -> SimulationKeyInput:
@@ -409,6 +581,7 @@ async def _load_from_file(
         data_loading.InvalidInjectionColumnError,
         data_loading.UnsupportedFileFormatError,
         data_loading.ConsumerColumnsError,
+        data_loading.NonFiniteValueError,
     ) as exc:
         await persistence.save_failure(snapshot.id, f"parse_failed: {exc}")
         return _Terminal(storage_key=snapshot.file_storage_key)
@@ -418,14 +591,15 @@ async def _load_from_file(
 
 
 async def _load_from_crm(
-    snapshot: _SimulationSnapshot, consumer_names: list[str]
+    snapshot: _SimulationSnapshot, consumer_names: list[str], *, iterations: int
 ) -> data_loading.SimulationRawData | _Terminal:
     """Read meter_consumption for this row's sharing operation and period.
 
     The pre-flight is re-run here rather than trusted from creation time: the
     data can have changed since the run was queued, and this is the read that
     actually feeds the simulation. In particular the participant-to-EAN match is
-    re-checked, so a meter deleted in the meantime fails loudly.
+    re-checked, so a meter deleted in the meantime fails loudly, and the run's
+    size (``iterations`` is the key's) is checked before the readings are read.
 
     Failure classification follows the module's existing matrix — a CRM read
     error is transient (NAK, redeliver), while rejected or unpivotable data is
@@ -450,7 +624,7 @@ async def _load_from_crm(
                 period_start=snapshot.period_start,
                 period_end=snapshot.period_end,
             )
-            preflight = crm_preflight.evaluate(summary, consumer_names)
+            preflight = crm_preflight.evaluate(summary, consumer_names, iterations=iterations)
             # Skip the expensive read when the period is already rejected.
             rows = (
                 await repository.fetch_rows(
@@ -481,6 +655,7 @@ async def _load_from_crm(
         crm_timeseries.CrmPivotError,
         data_loading.InvalidInjectionColumnError,
         data_loading.ConsumerColumnsError,
+        data_loading.NonFiniteValueError,
     ) as exc:
         await persistence.save_failure(snapshot.id, f"crm_pivot_failed: {exc}")
         return _Terminal(storage_key=None)

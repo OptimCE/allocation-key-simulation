@@ -11,9 +11,10 @@ aiohttp connector pool is shared across the asyncio loop.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from typing import cast
 
 from aiobotocore.session import get_session
@@ -21,6 +22,7 @@ from botocore.exceptions import (
     ClientError,
     EndpointConnectionError,
     ReadTimeoutError,
+    ResponseStreamingError,
 )
 from botocore.exceptions import (
     ConnectionError as BotoConnectionError,
@@ -47,9 +49,20 @@ class TransientStorageError(Exception):
     """
 
 
+class ObjectTooLarge(Exception):  # noqa: N818  # public exception name, like ObjectNotFound
+    """Raised by ``iter_object`` when the object is larger than the caller's ``max_bytes``."""
+
+    def __init__(self, key: str, size: int) -> None:
+        super().__init__(f"{key} holds {size} bytes")
+        self.size = size
+
+
 # The set of botocore error codes we treat as "the object isn't there".
 # NoSuchKey is the canonical S3 code; AWS sometimes returns 404 without one.
 _NOT_FOUND_CODES = {"NoSuchKey", "NoSuchBucket", "404"}
+
+# What ``iter_object`` asks the response body for at a time; a read may return less.
+STREAM_CHUNK_BYTES = 1024 * 1024
 
 
 @asynccontextmanager
@@ -89,20 +102,39 @@ async def upload(key: str, content: bytes, content_type: str | None = None) -> N
         )
 
 
-async def download(key: str) -> bytes:
-    """Fetch the object at ``key`` and return its bytes.
+async def upload_file(key: str, path: str, content_type: str | None = None) -> None:
+    """Upload the file at ``path`` as the object at ``key``, without reading it into memory.
 
-    Classifies errors into the two buckets the worker dispatcher cares about:
-    ``ObjectNotFound`` for missing keys (deterministic) and
-    ``TransientStorageError`` for everything that smells like a network /
-    server hiccup (retryable). Unexpected errors propagate so the dispatcher's
-    catch-all path can mark the row as ``unhandled_worker_error``.
+    aiobotocore streams an open file as the request body; botocore reads it in
+    chunks to sign the payload, then rewinds it. For results too large to hold
+    as one ``bytes``. Raises like ``upload``.
+    """
+    extra: dict[str, str] = {}
+    if content_type:
+        extra["ContentType"] = content_type
+    body = await asyncio.to_thread(open, path, "rb")
+    with body:
+        async with _client() as s3:
+            await s3.put_object(
+                Bucket=settings.STORAGE_BUCKET,
+                Key=key,
+                Body=body,
+                **extra,
+            )
+
+
+@contextmanager
+def _read_errors(key: str) -> Iterator[None]:
+    """Classify an error reading the object at ``key``.
+
+    Two buckets the worker dispatcher cares about: ``ObjectNotFound`` for
+    missing keys (deterministic) and ``TransientStorageError`` for everything
+    that smells like a network / server hiccup (retryable). Unexpected errors
+    propagate so the dispatcher's catch-all path can mark the row as
+    ``unhandled_worker_error``.
     """
     try:
-        async with _client() as s3:
-            response = await s3.get_object(Bucket=settings.STORAGE_BUCKET, Key=key)
-            async with response["Body"] as stream:
-                return cast(bytes, await stream.read())
+        yield
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code", "")
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
@@ -111,8 +143,53 @@ async def download(key: str) -> bytes:
         if status is not None and 500 <= status < 600:
             raise TransientStorageError(f"storage {status} for {key}") from exc
         raise
-    except (TimeoutError, EndpointConnectionError, BotoConnectionError, ReadTimeoutError) as exc:
+    except (
+        TimeoutError,
+        EndpointConnectionError,
+        BotoConnectionError,
+        ReadTimeoutError,
+        ResponseStreamingError,
+    ) as exc:
         raise TransientStorageError(f"storage transport: {exc}") from exc
+
+
+async def download(key: str) -> bytes:
+    """Fetch the object at ``key`` and return its bytes.
+
+    Errors are classified by ``_read_errors``.
+    """
+    with _read_errors(key):
+        async with _client() as s3:
+            response = await s3.get_object(Bucket=settings.STORAGE_BUCKET, Key=key)
+            async with response["Body"] as stream:
+                return cast(bytes, await stream.read())
+
+
+async def iter_object(
+    key: str, chunk_bytes: int = STREAM_CHUNK_BYTES, max_bytes: int | None = None
+) -> AsyncIterator[bytes]:
+    """Yield the object at ``key`` in chunks of at most ``chunk_bytes``, without holding it whole.
+
+    For objects too large to read as one ``bytes``. Errors are classified by
+    ``_read_errors``, the object's own (``ObjectNotFound``) included, and are
+    raised by the first ``anext``: a caller that must answer them before
+    sending anything awaits the first chunk itself. So is ``ObjectTooLarge``,
+    for an object over ``max_bytes``, raised before any of it is read.
+    """
+    with _read_errors(key):
+        async with _client() as s3:
+            response = await s3.get_object(Bucket=settings.STORAGE_BUCKET, Key=key)
+            # Read through aiobotocore's StreamingBody, which takes a size and
+            # checks Content-Length at the end; ``async with`` it only releases
+            # the connection (it enters as the raw aiohttp response, whose
+            # read() takes everything).
+            body = response["Body"]
+            async with body:
+                size = response.get("ContentLength")
+                if max_bytes is not None and size is not None and size > max_bytes:
+                    raise ObjectTooLarge(key, size)
+                while chunk := await body.read(chunk_bytes):
+                    yield chunk
 
 
 async def delete(key: str) -> None:

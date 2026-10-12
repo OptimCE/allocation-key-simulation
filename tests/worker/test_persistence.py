@@ -21,6 +21,9 @@ from simulation.result import ConsumerSimResult, IterationSimResult, KeySimResul
 from tests.factories.simulation_factory import create_simulation
 from worker import persistence
 
+# What the solver process wrote. storage.upload_file is mocked, so it is never opened.
+_SERIES_FILE = "simulation-timeseries-test.json"
+
 
 def _result() -> KeySimResult:
     consumer = ConsumerSimResult(
@@ -85,7 +88,7 @@ async def patched_factory(db_session, monkeypatch):
 
     monkeypatch.setattr(persistence, "AsyncSessionLocalFactory", _Factory())
     monkeypatch.setattr(persistence, "AsyncSessionCRMFactory", _Factory())
-    monkeypatch.setattr(persistence.storage, "upload", AsyncMock())
+    monkeypatch.setattr(persistence.storage, "upload_file", AsyncMock())
     yield
 
 
@@ -101,30 +104,32 @@ async def _count_results(db_session, simulation_id: int) -> int:
 async def test_save_success_writes_tree_and_flips_status(db_session, patched_factory):
     sim = await create_simulation(db_session, id_community=1)
 
-    await persistence.save_success(sim.id, _result())
+    await persistence.save_success(sim.id, _result(), _SERIES_FILE)
 
     await db_session.refresh(sim)
     assert sim.status == SimulationStatus.SUCCESS
     assert sim.result_storage_key == f"simulations/1/{sim.id}/result.json"
     assert await _count_results(db_session, sim.id) == 1
-    persistence.storage.upload.assert_awaited_once()
+    persistence.storage.upload_file.assert_awaited_once_with(
+        sim.result_storage_key, _SERIES_FILE, content_type="application/json"
+    )
 
 
 async def test_save_success_no_op_when_already_succeeded(db_session, patched_factory):
     sim = await create_simulation(db_session, id_community=1, status=SimulationStatus.SUCCESS)
-    await persistence.save_success(sim.id, _result())
+    await persistence.save_success(sim.id, _result(), _SERIES_FILE)
     assert await _count_results(db_session, sim.id) == 0
 
 
 async def test_save_success_idempotent_on_double_call(db_session, patched_factory):
     sim = await create_simulation(db_session, id_community=1)
-    await persistence.save_success(sim.id, _result())
-    await persistence.save_success(sim.id, _result())
+    await persistence.save_success(sim.id, _result(), _SERIES_FILE)
+    await persistence.save_success(sim.id, _result(), _SERIES_FILE)
     assert await _count_results(db_session, sim.id) == 1
 
 
 async def test_save_success_no_op_for_missing_row(db_session, patched_factory):
-    await persistence.save_success(999_999, _result())
+    await persistence.save_success(999_999, _result(), _SERIES_FILE)
     rows = await db_session.execute(select(SimulationModel))
     assert rows.scalars().all() == []
 

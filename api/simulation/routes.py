@@ -2,6 +2,7 @@ from datetime import date
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, File, Form, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.simulation.mappers import to_crm_data_preview
@@ -32,6 +33,11 @@ simulation_routes = APIRouter(
         Depends(require_feature(FeatureName.SIMULATION)),
     ]
 )
+
+# Upper bound of GET /{id}/timeseries?max_points: wider than any chart, and it
+# keeps a run of few participants over very many timesteps from answering its
+# iteration series whole.
+MAX_TIMESERIES_POINTS = 10_000
 
 
 # GET (/) : List simulations and their status (pending, success, failed).
@@ -94,15 +100,35 @@ async def get_simulation(
 
 
 # GET (/{id}/timeseries) : Per-timestep series for charting.
+#
+# Without max_points the stored object streams through as it is, per-consumer
+# series included, up to FULL_TIMESERIES_MAX_BYTES (api/simulation/service.py):
+# a run at the size limit stores 350-430 MB of JSON. The chart passes max_points
+# and gets each iteration's own series, sampled: a few hundred kB, which the
+# gateway (it decodes and re-encodes JSON, within 3 s) and the browser handle.
 @simulation_routes.get("/{id}/timeseries", response_model=ApiResponse[SimulationTimeseries])
 @with_default_error(default_error=errors.simulation.GET_TIMESERIES)
 async def get_timeseries(
     id: int,
     local_session: Annotated[AsyncSession, Depends(get_local_session)],
     crm_session: Annotated[AsyncSession, Depends(get_crm_session)],
+    max_points: Annotated[
+        int | None,
+        Query(
+            ge=1,
+            le=MAX_TIMESERIES_POINTS,
+            description=(
+                "Return only each iteration's own series, without the per-consumer ones,"
+                " with at most this many values each: every stride-th timestep from the"
+                " first (see `stride`)."
+            ),
+        ),
+    ] = None,
 ):
     service = SimulationService(local_session, crm_session)
-    data = await service.get_timeseries(id)
+    if max_points is None:
+        return StreamingResponse(await service.stream_timeseries(id), media_type="application/json")
+    data = await service.sample_timeseries(id, max_points)
     return ApiResponse[SimulationTimeseries](data=data)
 
 

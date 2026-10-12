@@ -64,31 +64,46 @@ class SimulationDetail(Simulation):
     )
 
 
+# A series value is null where the run's input had no number: an empty cell
+# in an uploaded file, before the worker refused those (json.dumps had stored
+# NaN, which JSON does not allow).
+Series = list[float | None]
+
+
 class ConsumerTimeseries(BaseModel):
     name: str
-    consumption: list[float]
-    energy_allocated: list[float]
-    energy_allocated_consumed: list[float]
-    residual_volume: list[float]
-    surplus: list[float]
+    consumption: Series
+    energy_allocated: Series
+    energy_allocated_consumed: Series
+    residual_volume: Series
+    surplus: Series
 
 
 class IterationTimeseries(BaseModel):
     number: int
-    consumption: list[float]
-    energy_allocated: list[float]
-    energy_allocated_consumed: list[float]
-    residual_volume: list[float]
-    surplus: list[float]
-    sharing_rate: list[float]
-    self_sufficiency_rate: list[float]
-    consumers: list[ConsumerTimeseries]
+    consumption: Series
+    energy_allocated: Series
+    energy_allocated_consumed: Series
+    residual_volume: Series
+    surplus: Series
+    sharing_rate: Series
+    self_sufficiency_rate: Series
+    consumers: list[ConsumerTimeseries] = Field(
+        ..., description="Per-consumer series. Empty when `max_points` was given."
+    )
 
 
 class SimulationTimeseries(BaseModel):
     """Per-timestep series for charting, stored as one object per run in storage."""
 
     iterations: list[IterationTimeseries]
+    stride: int = Field(
+        default=1,
+        description=(
+            "Value i of every series is timestep i * stride (from 0). Above 1 only when"
+            " `max_points` was given."
+        ),
+    )
 
 
 class SimulateRequest(BaseModel):

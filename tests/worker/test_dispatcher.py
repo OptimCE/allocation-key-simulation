@@ -14,13 +14,24 @@ when the object was already missing.
 
 from __future__ import annotations
 
+import os
 from unittest.mock import AsyncMock, MagicMock
 
+import numpy as np
 import pytest
 from sqlalchemy.exc import OperationalError
 
 from core.queue.helper import Event
+from shared import problem_size
 from shared.const import DataSource
+from shared.data_loading import SimulationRawData
+from shared.data_loading import load as parse_upload
+from simulation.inputs import (
+    SimulationConsumerInput,
+    SimulationIterationInput,
+    SimulationKeyInput,
+)
+from simulation.result import KeySimResult
 from worker import dispatcher
 
 _KEY = "simulations/1/test-uuid/data.csv"
@@ -61,6 +72,46 @@ def _snapshot(*, status: int = 0, file_storage_key: str = _KEY) -> dispatcher._S
     )
 
 
+def _read(path: str) -> bytes:
+    with open(path, "rb") as file:
+        return file.read()
+
+
+def _raw() -> SimulationRawData:
+    """One participant over four timesteps."""
+    return SimulationRawData(C=np.zeros((1, 4)), VA=np.ones((1, 4)), consumer_names=["C0"])
+
+
+def _key(iterations: int = 1) -> SimulationKeyInput:
+    return SimulationKeyInput(
+        name="k",
+        description="d",
+        iterations=[
+            SimulationIterationInput(
+                number=number,
+                energy_allocated_percentage=1.0,
+                consumers=[SimulationConsumerInput(name="C0", energy_allocated_percentage=-1.0)],
+            )
+            for number in range(iterations)
+        ],
+    )
+
+
+def _result() -> KeySimResult:
+    return KeySimResult(
+        name="k",
+        description="d",
+        consumption_total=0.0,
+        energy_allocated_total=0.0,
+        energy_allocated_consumed_total=0.0,
+        residual_volume_total=0.0,
+        surplus_total=0.0,
+        self_sufficiency_rate_total=0.0,
+        sharing_rate_total=0.0,
+        iterations=[],
+    )
+
+
 @pytest.fixture
 def patched_save(monkeypatch):
     save_success = AsyncMock()
@@ -84,14 +135,10 @@ def stub_pipeline(monkeypatch, patched_storage):
     """Default-success patches so each test overrides only the step it exercises."""
     monkeypatch.setattr(dispatcher, "_snapshot_simulation", AsyncMock(return_value=_snapshot()))
     monkeypatch.setattr(dispatcher, "_read_crm_key", AsyncMock(return_value=MagicMock()))
-    monkeypatch.setattr(dispatcher, "from_crm_allocation_key", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(dispatcher, "from_crm_allocation_key", MagicMock(return_value=_key()))
     monkeypatch.setattr(dispatcher, "consumer_names_of", MagicMock(return_value=["C0"]))
-    monkeypatch.setattr(
-        dispatcher.data_loading,
-        "load",
-        MagicMock(return_value=MagicMock(C=None, VA=None, consumer_names=["C0"])),
-    )
-    monkeypatch.setattr(dispatcher, "run_simulation", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(dispatcher.data_loading, "load", MagicMock(return_value=_raw()))
+    monkeypatch.setattr(dispatcher, "run_simulation", MagicMock(return_value=_result()))
 
 
 # ---- Malformed events ------------------------------------------------------
@@ -183,6 +230,27 @@ async def test_parse_failure_marks_failed(monkeypatch, patched_save, stub_pipeli
     dispatcher.storage.delete.assert_awaited_once_with(_KEY)
 
 
+async def test_empty_cell_marks_failed_before_the_solve(monkeypatch, patched_save, stub_pipeline):
+    # The real parser: pandas reads the empty cell as NaN, which used to make
+    # every total NaN and the finished run unreadable through the API.
+    save_success, save_failure = patched_save
+    monkeypatch.setattr(dispatcher.data_loading, "load", parse_upload)
+    dispatcher.storage.download.return_value = b"production,C0\n10,1\n10,\n"
+    solve = MagicMock(return_value=_result())
+    monkeypatch.setattr(dispatcher, "run_simulation", solve)
+    msg = FakeMsg(_event_bytes(1))
+
+    await dispatcher._make_handler()(msg)
+
+    assert msg.acked and not msg.naked
+    save_failure.assert_awaited_once_with(
+        1, "parse_failed: column 'C0' has 1 empty or non-numeric cell(s), the first in data row 2"
+    )
+    save_success.assert_not_awaited()
+    solve.assert_not_called()
+    dispatcher.storage.delete.assert_awaited_once_with(_KEY)
+
+
 async def test_compute_error_marks_failed(monkeypatch, patched_save, stub_pipeline):
     save_success, save_failure = patched_save
     monkeypatch.setattr(
@@ -253,6 +321,80 @@ async def test_persist_failure_naks_no_delete(monkeypatch, patched_save, stub_pi
     assert msg.naked and not msg.acked
     assert msg.nak_delay == dispatcher._NAK_RETRY_DELAY_SECONDS
     dispatcher.storage.delete.assert_not_awaited()
+
+
+# ---- The per-timestep series: a file from the solve, deleted after ---------
+
+
+async def test_success_hands_persistence_the_series_file_then_deletes_it(
+    patched_save, stub_pipeline, tmp_path
+):
+    save_success, _save_failure = patched_save
+    seen: dict = {}
+
+    async def save(simulation_id, result, timeseries_path):
+        seen["result"] = result
+        seen["json"] = _read(timeseries_path)
+
+    save_success.side_effect = save
+    msg = FakeMsg(_event_bytes(1))
+
+    await dispatcher._make_handler()(msg)
+
+    assert msg.acked
+    assert seen["result"] == _result()
+    assert seen["json"] == b'{"iterations": []}'
+    assert os.listdir(tmp_path) == []  # tests/worker/conftest.py points tempfile here
+
+
+async def test_persist_failure_still_deletes_the_series_file(patched_save, stub_pipeline, tmp_path):
+    save_success, _save_failure = patched_save
+    save_success.side_effect = OperationalError("UPDATE", {}, Exception("conn lost"))
+    msg = FakeMsg(_event_bytes(1))
+
+    await dispatcher._make_handler()(msg)
+
+    assert msg.naked
+    save_success.assert_awaited_once()
+    assert os.listdir(tmp_path) == []
+
+
+# ---- Too large to run: refused on the parsed shape, before the solve -------
+
+
+async def test_run_too_large_fails_before_the_solve(monkeypatch, patched_save, stub_pipeline):
+    # 1 participant x 4 timesteps x 2 iterations = 8 cells, one over the limit.
+    monkeypatch.setattr(problem_size, "MAX_SIMULATION_CELLS", 7)
+    monkeypatch.setattr(dispatcher, "from_crm_allocation_key", MagicMock(return_value=_key(2)))
+    save_success, save_failure = patched_save
+    msg = FakeMsg(_event_bytes(1))
+
+    await dispatcher._make_handler()(msg)
+
+    assert msg.acked and not msg.naked
+    dispatcher.run_simulation.assert_not_called()
+    save_success.assert_not_awaited()
+    save_failure.assert_awaited_once()
+    assert save_failure.await_args.args[1] == (
+        "simulation_too_large: 1 participants x 4 timesteps x 2 iterations = 8 cells "
+        "exceed the 7 limit; shorten the period, or simulate a key with fewer "
+        "participants or iterations"
+    )
+    dispatcher.storage.delete.assert_awaited_once_with(_KEY)
+
+
+async def test_run_at_the_limit_is_solved(monkeypatch, patched_save, stub_pipeline):
+    monkeypatch.setattr(problem_size, "MAX_SIMULATION_CELLS", 8)
+    monkeypatch.setattr(dispatcher, "from_crm_allocation_key", MagicMock(return_value=_key(2)))
+    save_success, save_failure = patched_save
+    msg = FakeMsg(_event_bytes(1))
+
+    await dispatcher._make_handler()(msg)
+
+    assert msg.acked
+    dispatcher.run_simulation.assert_called_once()
+    save_success.assert_awaited_once()
+    save_failure.assert_not_awaited()
 
 
 # ---- Unhandled error in snapshot (catch-all → ack + FAILED, no delete) -----

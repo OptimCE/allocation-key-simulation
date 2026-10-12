@@ -21,12 +21,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from core.errors.errors import Error
+from shared import problem_size
 from shared.crm_meter_repository import CrmDataSummary
 from shared.custom_errors import errors
 
-# A year of quarter-hours across ~60 meters is ~2.1 M rows, which the worker
-# pivots comfortably. Well past that we would rather refuse than risk the
-# worker being OOM-killed mid-run, which reads to the manager as a silent hang.
+# Bounds the worker's read of the readings, which runs in its main process: at
+# this limit that read and the pivot peak near 1.2 GB (README, "Resource
+# sizing"). The run itself is bounded separately, and for a key with more than
+# one iteration more tightly, by problem_size.MAX_SIMULATION_CELLS. Raise this
+# only together with the worker's mem_limit.
 MAX_READING_ROWS = 5_000_000
 
 
@@ -68,6 +71,8 @@ class Preflight:
 def evaluate(
     summary: CrmDataSummary,
     key_consumer_names: Sequence[str],
+    *,
+    iterations: int,
 ) -> Preflight:
     """Classify a period's metering data against the key being simulated.
 
@@ -75,6 +80,9 @@ def evaluate(
     reported. Duplicates are, because there is no unique constraint on
     ``meter_consumption(ean, timestamp)`` and a repeated import would inflate a
     participant's volume with no visible symptom.
+
+    ``iterations`` is the key's iteration count: with the participants and the
+    period's grid it sizes the run (``problem_size``).
     """
     participants = [normalize_participant(n) for n in key_consumer_names]
 
@@ -113,6 +121,13 @@ def evaluate(
                 ),
             )
         )
+
+    # The pivot gives the solver one row per participant and one column per
+    # timestamp of the common grid. Checked here, before the worker fetches the
+    # readings, rather than on the parsed matrix.
+    oversize = problem_size.too_large(len(participants), summary.grid_size, iterations)
+    if oversize:
+        blockers.append(Blocker(error=errors.simulation.SIMULATION_TOO_LARGE, detail=oversize))
 
     duplicates = summary.duplicate_eans
     if duplicates:

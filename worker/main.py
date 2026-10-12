@@ -31,7 +31,7 @@ from core.queue.init import close_nats, get_jetstream, init_nats
 from core.realtime import log_realtime_state
 from core.tracing import setup_tracer_provider
 from shared.const import SIMULATION_STREAM
-from worker import dispatcher
+from worker import dispatcher, timeseries
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +53,20 @@ _CONSUMER_NAME = "worker-simulation"
 _HEARTBEAT_PATH = pathlib.Path("/tmp/worker.alive")  # noqa: S108 — dedicated container, non-root app user
 
 # How long shutdown waits for in-flight solves to finish + ack before giving up
-# on them (they redeliver after ack_wait — the persistence idempotency guard
-# makes that safe). Kept comfortably under a typical orchestrator SIGTERM grace
-# period so we don't get SIGKILL'd mid-drain.
+# on them (cancelling one stops its in-progress acks, so it redelivers once
+# ack_wait runs out — the persistence idempotency guard makes that safe). Kept
+# comfortably under a typical orchestrator SIGTERM grace period so we don't get
+# SIGKILL'd mid-drain.
 _INFLIGHT_DRAIN_TIMEOUT_SECONDS = 25
+
+# Each solver process raises its own OOM score to the maximum (Linux only), so
+# that when the container reaches its memory limit the kernel kills a solver
+# process rather than this one. A dead solver process is a BrokenProcessPool the
+# dispatcher retries a bounded number of times; a dead main process takes the
+# worker down and its message comes back after ack_wait, uncounted. Raising the
+# score needs no privilege; lowering it would.
+_OOM_SCORE_ADJ_PATH = pathlib.Path("/proc/self/oom_score_adj")
+_SOLVER_OOM_SCORE_ADJ = 1000
 
 
 def _detect_available_cpus() -> int:
@@ -110,8 +120,16 @@ def _init_solver_process() -> None:
     importing the compute module here. On a fork start method the child already
     inherits it; on a spawn start method (dev on Windows/macOS) this makes the
     import explicit so the first solve isn't slowed by it.
+
+    Also makes this process the kernel's first choice for an OOM kill
+    (``_OOM_SCORE_ADJ_PATH``).
     """
     importlib.import_module("simulation.compute")
+    try:
+        _OOM_SCORE_ADJ_PATH.write_text(f"{_SOLVER_OOM_SCORE_ADJ}\n")
+    except OSError as exc:
+        # No /proc (Windows, macOS): the kernel's own choice, by size, stands.
+        logger.debug("Could not raise the solver process's OOM score: %s", exc)
 
 
 class _SolverPool(Executor):
@@ -121,10 +139,12 @@ class _SolverPool(Executor):
     ProcessPoolExecutor: every subsequent ``submit`` raises
     ``BrokenProcessPool``. Left unhandled, the worker would keep running and
     look healthy while silently failing every solve. Rebuilding on the next
-    submit restores capacity; the simulation that tripped the break is
-    redelivered (``dispatcher._run_simulation`` maps the break to a transient
-    failure). ``submit`` is only ever called from the event-loop thread (via
-    ``loop.run_in_executor``), so the rebuild needs no extra locking.
+    submit restores capacity. Every simulation solving when the pool broke
+    sees the break, and the dispatcher retries each on a later delivery until
+    ``dispatcher._MAX_SOLVER_CRASH_DELIVERIES``, then marks it FAILED
+    (``solver_crashed``). ``submit`` is only ever called from the event-loop
+    thread (via ``loop.run_in_executor``), so the rebuild needs no extra
+    locking.
     """
 
     def __init__(self, max_workers: int, initializer: Callable[[], None]) -> None:
@@ -201,12 +221,42 @@ async def _poll_queue_depth(js, shutdown_event: asyncio.Event) -> None:
             continue
 
 
+async def _drain_inflight(inflight: set[asyncio.Task]) -> None:
+    """Let in-flight simulations finish + ack while NATS is still up.
+
+    The callback returns as soon as it spawns the task, so sub.drain() does not
+    cover this work — await it explicitly, bounded so a long solve can't stall
+    shutdown past the SIGTERM grace. Stragglers are cancelled, which also stops
+    their in-progress acks: they redeliver once ack_wait runs out (the
+    persistence idempotency guard makes that safe).
+    """
+    if not inflight:
+        return
+    logger.info("Waiting for %d in-flight simulation(s) to finish...", len(inflight))
+    _done, pending = await asyncio.wait(set(inflight), timeout=_INFLIGHT_DRAIN_TIMEOUT_SECONDS)
+    if pending:
+        logger.warning(
+            "%d simulation(s) still running after %ds; cancelling — they will be "
+            "redelivered after ack_wait",
+            len(pending),
+            _INFLIGHT_DRAIN_TIMEOUT_SECONDS,
+        )
+        for task in pending:
+            task.cancel()
+
+
 async def main() -> None:
     configure_logging()
     # Absence of this line means the image predates the realtime feature —
     # see core/realtime/bus.py. Must come after configure_logging().
     log_realtime_state("simulation-key-worker")
     setup_tracer_provider()
+
+    # Before any solve: a process killed between its solve and the upload left
+    # its time-series file, and a restarted container keeps /tmp.
+    leftovers = timeseries.remove_leftovers()
+    if leftovers:
+        logger.warning("Removed %d time-series file(s) left by an earlier worker", leftovers)
 
     await _connect_nats_with_retry()
     js = get_jetstream()
@@ -249,25 +299,7 @@ async def main() -> None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await queue_depth_task
 
-        # Let in-flight solves finish + ack while NATS is still up. The callback
-        # returns as soon as it spawns the task, so sub.drain() no longer covers
-        # this work — await it explicitly, bounded so a long solve can't stall
-        # shutdown past the SIGTERM grace. Stragglers redeliver after ack_wait
-        # (the persistence idempotency guard makes that safe).
-        if inflight:
-            logger.info("Waiting for %d in-flight simulation(s) to finish...", len(inflight))
-            _done, pending = await asyncio.wait(
-                set(inflight), timeout=_INFLIGHT_DRAIN_TIMEOUT_SECONDS
-            )
-            if pending:
-                logger.warning(
-                    "%d simulation(s) still running after %ds; cancelling — they will be "
-                    "redelivered after ack_wait",
-                    len(pending),
-                    _INFLIGHT_DRAIN_TIMEOUT_SECONDS,
-                )
-                for task in pending:
-                    task.cancel()
+        await _drain_inflight(inflight)
 
         if sub is not None:
             try:
