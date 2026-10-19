@@ -28,7 +28,9 @@
       "CRM_NO_INJECTION": "In diesem Zeitraum wurde nichts eingespeist, es gibt also nichts zu teilen (Code: 2115)",
       "CRM_RANGE_TOO_LARGE": "Der gewählte Zeitraum enthält zu viele Messwerte, bitte kürzen Sie ihn (Code: 2116)",
       "KEY_CONSUMERS_NOT_MATCHED": "Einige Teilnehmer des Schlüssels stimmen mit keinem Zähler (EAN) in diesem Zeitraum überein (Code: 2117)",
-      "GET_CRM_PREVIEW": "Die Messdaten konnten nicht geprüft werden (Code: 2118)"
+      "GET_CRM_PREVIEW": "Die Messdaten konnten nicht geprüft werden (Code: 2118)",
+      "SIMULATION_TOO_LARGE": "Zu viele Daten für eine einzelne Simulation (Teilnehmer × Zeitschritte × Iterationen), bitte kürzen Sie den Zeitraum oder simulieren Sie einen Schlüssel mit weniger Teilnehmern oder Iterationen (Code: 2119)",
+      "TIMESERIES_TOO_LARGE": "Die Zeitreihen dieser Simulation sind zu groß, um vollständig gesendet zu werden (Code: 2120)"
     }
   }
 }

@@ -55,6 +55,14 @@ class _SimulationErrors:
     KEY_CONSUMERS_NOT_MATCHED = Error(code=2117, key="ERRORS.SIMULATION.KEY_CONSUMERS_NOT_MATCHED")
     GET_CRM_PREVIEW = Error(code=2118, key="ERRORS.SIMULATION.GET_CRM_PREVIEW")
 
+    # Participants x timesteps x iterations beyond what one run may produce
+    # (shared/problem_size.py). Either source: CRM pre-flight or file upload.
+    SIMULATION_TOO_LARGE = Error(code=2119, key="ERRORS.SIMULATION.SIMULATION_TOO_LARGE")
+
+    # GET /{id}/timeseries without max_points: the stored object is over
+    # api/simulation/service.py::FULL_TIMESERIES_MAX_BYTES.
+    TIMESERIES_TOO_LARGE = Error(code=2120, key="ERRORS.SIMULATION.TIMESERIES_TOO_LARGE")
+
 
 class _Errors:
     auth = _AuthErrors()

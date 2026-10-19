@@ -4,10 +4,14 @@ Each case is hand-computed so a regression in ``run_simulation`` surfaces here
 rather than silently in production numbers.
 """
 
+import io
+import re
+
 import numpy as np
+import openpyxl
 import pytest
 
-from shared.data_loading import ConsumerColumnsError, load
+from shared.data_loading import ConsumerColumnsError, NonFiniteValueError, load
 from simulation.compute import SimulationInputError, run_simulation
 from simulation.inputs import (
     SimulationConsumerInput,
@@ -163,3 +167,43 @@ def test_data_loading_missing_consumer_column_raises():
     csv = b"prod,A\n1000,200\n"
     with pytest.raises(ConsumerColumnsError):
         load(csv, "data.csv", "prod", ["A", "B"])
+
+
+@pytest.mark.parametrize(
+    ("csv", "message"),
+    [
+        (
+            b"prod,A,B\n10,1,2\n10,,2\n10,1,\n10,,2\n",
+            "column 'A' has 2 empty or non-numeric cell(s), the first in data row 2",
+        ),
+        (b"prod,A,B\n10,1,2\n,1,2\n", "column 'prod' has 1 empty"),
+        (
+            b"prod,A,B\n10,1,inf\n",
+            "column 'B' has 1 empty or non-numeric cell(s), the first in data row 1",
+        ),
+        (b"prod,A,B\n10,1,NaN\n", "column 'B'"),
+    ],
+    ids=["consumer", "injection", "inf", "nan"],
+)
+def test_data_loading_refuses_empty_and_non_finite_cells(csv, message):
+    # One NaN used to make every total of the run NaN, which the API answered with a 500.
+    with pytest.raises(NonFiniteValueError, match=re.escape(message)):
+        load(csv, "data.csv", "prod", ["A", "B"])
+
+
+def test_data_loading_refuses_an_empty_xlsx_cell():
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    for row in (["prod", "A"], [10, 1], [10, None], [10, 3]):
+        sheet.append(row)
+    content = io.BytesIO()
+    workbook.save(content)
+
+    with pytest.raises(NonFiniteValueError, match="column 'A' has 1 .* data row 2"):
+        load(content.getvalue(), "data.xlsx", "prod", ["A"])
+
+
+def test_data_loading_ignores_empty_cells_in_other_columns():
+    csv = b"prod,A,notes\n10,1,\n10,2,x\n"
+    raw = load(csv, "data.csv", "prod", ["A"])
+    assert raw.C.tolist() == [[1.0, 2.0]]

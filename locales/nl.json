@@ -28,7 +28,9 @@
       "CRM_NO_INJECTION": "Er is in deze periode niets geïnjecteerd, dus er valt niets te delen (code: 2115)",
       "CRM_RANGE_TOO_LARGE": "De geselecteerde periode bevat te veel meetwaarden, kies een kortere periode (code: 2116)",
       "KEY_CONSUMERS_NOT_MATCHED": "Sommige deelnemers van de sleutel komen met geen enkele meter (EAN) in deze periode overeen (code: 2117)",
-      "GET_CRM_PREVIEW": "De meetgegevens konden niet worden gecontroleerd (code: 2118)"
+      "GET_CRM_PREVIEW": "De meetgegevens konden niet worden gecontroleerd (code: 2118)",
+      "SIMULATION_TOO_LARGE": "Te veel gegevens voor één simulatie (deelnemers × tijdstappen × iteraties), kies een kortere periode of simuleer een sleutel met minder deelnemers of iteraties (code: 2119)",
+      "TIMESERIES_TOO_LARGE": "De tijdreeksen van deze simulatie zijn te groot om volledig te worden verzonden (code: 2120)"
     }
   }
 }

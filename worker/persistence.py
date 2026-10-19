@@ -9,17 +9,21 @@ call from any branch of the dispatcher.
 
 Idempotency under JetStream redelivery
 --------------------------------------
-A long delivery can exceed ack_wait, causing a concurrent second delivery.
+A running simulation can still outlive ack_wait when its in-progress acks stop
+reaching JetStream (NATS lost mid-run), causing a concurrent second delivery.
 Both helpers perform a conditional ``UPDATE simulation SET status=... WHERE
 id=? AND status=PENDING`` and use the affected-row count as a lock: only the
 worker whose UPDATE actually flipped the row proceeds. The per-timestep result
 object is written under a deterministic key (``simulations/{community}/{id}/
 result.json``), so even a re-run overwrites in place rather than orphaning.
+
+The per-timestep series arrive as a JSON file the solver process wrote
+(``worker.timeseries``), never as Python objects: at the largest sizes they
+would not fit in this process.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 
 from sqlalchemy import update
@@ -41,37 +45,6 @@ from simulation.result import KeySimResult
 logger = logging.getLogger(__name__)
 
 _ERROR_MESSAGE_MAX_LEN = 2000
-
-
-def _timeseries_bytes(result: KeySimResult) -> bytes:
-    """Serialise the per-timestep series to the SimulationTimeseries JSON shape."""
-    payload = {
-        "iterations": [
-            {
-                "number": it.number,
-                "consumption": it.consumption,
-                "energy_allocated": it.energy_allocated,
-                "energy_allocated_consumed": it.energy_allocated_consumed,
-                "residual_volume": it.residual_volume,
-                "surplus": it.surplus,
-                "sharing_rate": it.sharing_rate,
-                "self_sufficiency_rate": it.self_sufficiency_rate,
-                "consumers": [
-                    {
-                        "name": c.name,
-                        "consumption": c.consumption,
-                        "energy_allocated": c.energy_allocated,
-                        "energy_allocated_consumed": c.energy_allocated_consumed,
-                        "residual_volume": c.residual_volume,
-                        "surplus": c.surplus,
-                    }
-                    for c in it.consumers
-                ],
-            }
-            for it in result.iterations
-        ]
-    }
-    return json.dumps(payload).encode()
 
 
 def _build_key_result(
@@ -124,8 +97,13 @@ def _build_key_result(
     )
 
 
-async def save_success(simulation_id: int, result: KeySimResult) -> None:
+async def save_success(simulation_id: int, result: KeySimResult, timeseries_path: str) -> None:
     """Persist a successful run: claim the row, write the tree + time-series.
+
+    ``result`` carries the totals; its per-timestep series may be empty
+    (``worker.timeseries.without_series``). ``timeseries_path`` is the file
+    holding those series as JSON, streamed to storage as is. The caller deletes
+    it.
 
     Order: claim (UPDATE ... WHERE status=PENDING) → build tree → upload the
     time-series object → commit. The upload happens inside the transaction so a
@@ -163,8 +141,8 @@ async def save_success(simulation_id: int, result: KeySimResult) -> None:
         await session.flush()
 
         # Upload the per-timestep series (deterministic key, overwrite-safe).
-        await storage.upload(
-            result_storage_key, _timeseries_bytes(result), content_type="application/json"
+        await storage.upload_file(
+            result_storage_key, timeseries_path, content_type="application/json"
         )
 
         await session.commit()

@@ -10,7 +10,8 @@ run several simulations in parallel:
 * ``worker.main._SolverPool`` — rebuilds itself when a pool worker dies.
 * ``worker.dispatcher._run_simulation`` / ``_run_simulation_subprocess`` — the
   inline-vs-executor branch, the picklable subprocess entry point, and the
-  broken-pool → transient mapping.
+  broken-pool → solver-crash mapping (what the dispatcher then does with a
+  crash is in test_dispatcher_redelivery.py).
 * ``worker.dispatcher._make_handler`` spawning path — when an ``inflight`` set
   is provided the callback returns immediately and the work runs as a tracked
   background task (inline-to-completion when it is not).
@@ -23,15 +24,18 @@ payloads is asserted separately.
 from __future__ import annotations
 
 import asyncio
+import io
+import os
 import pickle
+import sys
 from concurrent.futures import Executor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 import pytest
-from nats.js.api import ConsumerConfig
 
 from core.queue.helper import Event
+from shared.const import SIMULATION_SUBJECT
 from shared.data_loading import SimulationRawData
 from simulation.inputs import (
     SimulationConsumerInput,
@@ -39,6 +43,7 @@ from simulation.inputs import (
     SimulationKeyInput,
 )
 from simulation.result import KeySimResult
+from tests.fake_jetstream import FakeJetStream
 from worker import dispatcher
 from worker import main as worker_main
 
@@ -63,6 +68,11 @@ def _key() -> SimulationKeyInput:
 
 def _raw() -> SimulationRawData:
     return SimulationRawData(C=np.zeros((1, 3)), VA=np.ones((1, 3)), consumer_names=["A"])
+
+
+def _read(path: str) -> bytes:
+    with open(path, "rb") as file:
+        return file.read()
 
 
 def _result() -> KeySimResult:
@@ -207,6 +217,8 @@ def test_solve_payloads_survive_pickling():
     assert raw_rt.C.shape == (1, 3)
     assert raw_rt.consumer_names == ["A"]
     assert isinstance(pickle.loads(pickle.dumps(res)), KeySimResult)  # noqa: S301
+    solved = dispatcher._Solved(result=res, timeseries_path="series.json")
+    assert pickle.loads(pickle.dumps(solved)) == solved  # noqa: S301
 
 
 # ---------------------------------------------------------------------------
@@ -216,8 +228,9 @@ def test_solve_payloads_survive_pickling():
 
 async def test_run_simulation_inline_when_no_executor(monkeypatch):
     monkeypatch.setattr(dispatcher, "run_simulation", lambda key, c, va, names: _result())
-    result = await dispatcher._run_simulation(_key(), _raw(), executor=None, semaphore=None)
-    assert isinstance(result, KeySimResult)
+    solved = await dispatcher._run_simulation(_key(), _raw(), executor=None, semaphore=None)
+    assert solved.result == _result()
+    assert _read(solved.timeseries_path) == b'{"iterations": []}'
 
 
 async def test_run_simulation_uses_executor_and_semaphore(monkeypatch):
@@ -225,21 +238,21 @@ async def test_run_simulation_uses_executor_and_semaphore(monkeypatch):
     monkeypatch.setattr(dispatcher, "run_simulation", lambda key, c, va, names: _result())
     semaphore = asyncio.Semaphore(1)
     with ThreadPoolExecutor(max_workers=1) as ex:
-        result = await dispatcher._run_simulation(_key(), _raw(), executor=ex, semaphore=semaphore)
-    assert isinstance(result, KeySimResult)
+        solved = await dispatcher._run_simulation(_key(), _raw(), executor=ex, semaphore=semaphore)
+    assert solved.result == _result()
     # Semaphore released after the solve so the pool slot is reusable.
     assert semaphore.locked() is False
 
 
-async def test_run_simulation_broken_pool_is_transient():
-    """A BrokenProcessPool from the executor is mapped to a transient failure
-    (so the message is redelivered rather than wrongly marked FAILED)."""
+async def test_run_simulation_broken_pool_is_a_solver_crash():
+    """A BrokenProcessPool from the executor is reported as a solver crash,
+    which the dispatcher retries on a few deliveries before marking FAILED."""
 
     class _BrokenExecutor(Executor):
         def submit(self, fn, /, *args, **kwargs):
             raise BrokenProcessPool("worker died")
 
-    with pytest.raises(dispatcher._TransientError):
+    with pytest.raises(dispatcher._SolverCrashError, match="worker died"):
         await dispatcher._run_simulation(_key(), _raw(), executor=_BrokenExecutor(), semaphore=None)
 
 
@@ -252,9 +265,86 @@ def test_run_simulation_subprocess_calls_run_simulation(monkeypatch):
         return _result()
 
     monkeypatch.setattr(dispatcher, "run_simulation", fake_run)
-    result = dispatcher._run_simulation_subprocess(_key(), _raw())
-    assert isinstance(result, KeySimResult)
+    solved = dispatcher._run_simulation_subprocess(_key(), _raw())
+    assert solved.result == _result()
     assert captured["names"] == ["A"]
+
+
+def test_run_simulation_subprocess_keeps_the_series_out_of_what_it_returns():
+    # The real solve: the series go to the file, only the totals come back.
+    solved = dispatcher._run_simulation_subprocess(_key(), _raw())
+    full = dispatcher.run_simulation(_key(), _raw().C, _raw().VA, ["A"])
+
+    assert solved.result == dispatcher.timeseries.without_series(full)
+    assert solved.result.iterations[0].consumers[0].surplus == []
+    buffer = io.BytesIO()
+    dispatcher.timeseries.write_json(full, buffer)
+    assert _read(solved.timeseries_path) == buffer.getvalue()
+
+
+def test_run_simulation_subprocess_removes_its_file_when_it_cannot_return(monkeypatch, tmp_path):
+    def broken(result):
+        raise MemoryError("no room for the reply")
+
+    monkeypatch.setattr(dispatcher.timeseries, "without_series", broken)
+
+    with pytest.raises(MemoryError):
+        dispatcher._run_simulation_subprocess(_key(), _raw())
+
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_a_real_solver_process_returns_the_totals_and_writes_the_series():
+    # A real pool with the real initializer: what crosses the process boundary
+    # is the series-free result and a path, and the file is complete.
+    pool = worker_main._SolverPool(1, worker_main._init_solver_process)
+    try:
+        solved = await dispatcher._run_simulation(_key(), _raw(), executor=pool, semaphore=None)
+    finally:
+        pool.shutdown(wait=True)
+    try:
+        full = dispatcher.run_simulation(_key(), _raw().C, _raw().VA, ["A"])
+        assert solved.result == dispatcher.timeseries.without_series(full)
+        buffer = io.BytesIO()
+        dispatcher.timeseries.write_json(full, buffer)
+        assert _read(solved.timeseries_path) == buffer.getvalue()
+    finally:
+        # A spawned process does not inherit the test's temp dir.
+        dispatcher.timeseries.remove(solved.timeseries_path)
+
+
+# ---------------------------------------------------------------------------
+# The solver process volunteers for the OOM killer
+# ---------------------------------------------------------------------------
+
+
+def test_solver_process_raises_its_oom_score(monkeypatch, tmp_path):
+    score = tmp_path / "oom_score_adj"
+    score.write_text("0\n")
+    monkeypatch.setattr(worker_main, "_OOM_SCORE_ADJ_PATH", score)
+
+    worker_main._init_solver_process()
+
+    assert score.read_text() == "1000\n"
+
+
+def test_solver_process_starts_where_there_is_no_oom_score(monkeypatch, tmp_path):
+    monkeypatch.setattr(worker_main, "_OOM_SCORE_ADJ_PATH", tmp_path / "no-proc" / "oom_score_adj")
+
+    worker_main._init_solver_process()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/<pid>/oom_score_adj")
+def test_on_linux_only_the_solver_processes_volunteer():
+    pool = worker_main._SolverPool(1, worker_main._init_solver_process)
+    try:
+        solver_pid = pool.submit(os.getpid).result(timeout=30)
+        with open(f"/proc/{solver_pid}/oom_score_adj") as solver:
+            assert solver.read().strip() == "1000"
+        with open("/proc/self/oom_score_adj") as main:
+            assert main.read().strip() != "1000"
+    finally:
+        pool.shutdown(wait=True)
 
 
 # ---------------------------------------------------------------------------
@@ -317,34 +407,39 @@ async def test_handler_runs_inline_when_no_inflight(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def _simulations_js() -> FakeJetStream:
+    return FakeJetStream({"SIMULATIONS": ["optimce.simulation.>"]})
+
+
 async def test_subscribe_sets_ack_wait_and_max_ack_pending():
-    captured: dict = {}
+    js = _simulations_js()
 
-    class _FakeJS:
-        async def subscribe(self, **kwargs):
-            captured.update(kwargs)
-            return object()
+    await dispatcher.subscribe(js, max_ack_pending=3)
 
-    await dispatcher.subscribe(_FakeJS(), max_ack_pending=3)
-
-    config = captured["config"]
+    config = js.stored(SIMULATION_SUBJECT, dispatcher._DURABLE)
     assert config.ack_wait == dispatcher._ACK_WAIT_SECONDS
     assert config.max_ack_pending == 3
 
 
-async def test_subscribe_omits_max_ack_pending_when_unset():
-    """Backwards-compatible default: no explicit max_ack_pending override."""
-    captured: dict = {}
+async def test_subscribe_updates_a_durable_an_earlier_build_created():
+    """The dev durable, created 2026-06-05, kept the old 120 s ack_wait."""
+    js = _simulations_js()
+    js.seed(SIMULATION_SUBJECT, dispatcher._DURABLE, ack_wait=120.0)
 
-    class _FakeJS:
-        async def subscribe(self, **kwargs):
-            captured.update(kwargs)
-            return object()
+    await dispatcher.subscribe(js, max_ack_pending=1)
 
-    await dispatcher.subscribe(_FakeJS())
-
-    config = captured["config"]
+    config = js.stored(SIMULATION_SUBJECT, dispatcher._DURABLE)
     assert config.ack_wait == dispatcher._ACK_WAIT_SECONDS
-    # Left at the ConsumerConfig default rather than forced to a value.
-    default = ConsumerConfig(ack_wait=dispatcher._ACK_WAIT_SECONDS)
-    assert config.max_ack_pending == default.max_ack_pending
+    assert config.max_ack_pending == 1
+
+
+async def test_subscribe_omits_max_ack_pending_when_unset():
+    """Without an explicit max_ack_pending the durable keeps the broker's value."""
+    js = _simulations_js()
+    js.seed(SIMULATION_SUBJECT, dispatcher._DURABLE, max_ack_pending=7)
+
+    await dispatcher.subscribe(js)
+
+    config = js.stored(SIMULATION_SUBJECT, dispatcher._DURABLE)
+    assert config.ack_wait == dispatcher._ACK_WAIT_SECONDS
+    assert config.max_ack_pending == 7

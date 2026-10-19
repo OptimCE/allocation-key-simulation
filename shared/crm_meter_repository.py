@@ -35,6 +35,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # crm-backend's CONSUMPTION_TIMEZONE.
 _METERING_TZ = ZoneInfo("Europe/Brussels")
 
+# Rows fetch_rows takes from the cursor at a time.
+_FETCH_PARTITION_ROWS = 10_000
+
 
 def period_bounds(
     period_start: date, period_end: date
@@ -123,9 +126,12 @@ class CrmDataSummary:
         return [e for e in self.eans if e.distinct_ts < self.grid_size]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ConsumptionRow:
-    """One metering reading, as consumed by the pivot."""
+    """One metering reading, as consumed by the pivot.
+
+    Slotted: a period holds up to ``crm_preflight.MAX_READING_ROWS`` of them.
+    """
 
     timestamp: datetime.datetime
     ean: str
@@ -245,9 +251,16 @@ class CrmMeterRepository:
 
         Only ever called from the worker: a year of quarter-hours across a few
         dozen meters is well past what belongs on a 30-second request path.
+
+        Read in the worker's main process, so built lean: the rows arrive in
+        partitions from a server-side cursor instead of all at once, and every
+        row of a meter shares one EAN string, every row of an instant one
+        timestamp. At ``crm_preflight.MAX_READING_ROWS`` this read and the pivot
+        peak near 1.2 GB; fetching everything and keeping each row's own objects
+        took about twice that.
         """
         start, end_exclusive = period_bounds(period_start, period_end)
-        result = await self._session.execute(
+        result = await self._session.stream(
             text(
                 """
                 SELECT mc.timestamp                 AS ts,
@@ -268,12 +281,18 @@ class CrmMeterRepository:
                 "end_excl": end_exclusive,
             },
         )
-        return [
-            ConsumptionRow(
-                timestamp=row["ts"],
-                ean=row["ean"],
-                gross=float(row["gross"]),
-                inj_gross=float(row["inj_gross"]),
-            )
-            for row in result.mappings()
-        ]
+        eans: dict[str, str] = {}
+        timestamps: dict[datetime.datetime, datetime.datetime] = {}
+        rows: list[ConsumptionRow] = []
+        async for partition in result.mappings().partitions(_FETCH_PARTITION_ROWS):
+            for row in partition:
+                ts, ean = row["ts"], row["ean"]
+                rows.append(
+                    ConsumptionRow(
+                        timestamp=timestamps.setdefault(ts, ts),
+                        ean=eans.setdefault(ean, ean),
+                        gross=float(row["gross"]),
+                        inj_gross=float(row["inj_gross"]),
+                    )
+                )
+        return rows

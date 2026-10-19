@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from shared import problem_size
 from shared.const import DataSource
 from shared.crm_meter_repository import ConsumptionRow, CrmDataSummary, EanCoverage
 from simulation.inputs import (
@@ -139,7 +140,7 @@ def _patch_crm(monkeypatch, *, summary, rows=None, raises: Exception | None = No
 async def test_returns_raw_data_aligned_to_the_key(monkeypatch, patched_save):
     repository = _patch_crm(monkeypatch, summary=_summary(_HEALTHY), rows=_rows())
 
-    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A])
+    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A], iterations=1)
 
     assert not isinstance(result, dispatcher._Terminal)
     assert result.consumer_names == [_EAN_A]
@@ -162,7 +163,7 @@ async def test_participant_order_follows_the_key(monkeypatch, patched_save):
         rows=_rows(),
     )
 
-    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_PV, _EAN_A])
+    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_PV, _EAN_A], iterations=1)
 
     # Rows must line up with the key's order, not the database's.
     assert result.consumer_names == [_EAN_PV, _EAN_A]
@@ -187,7 +188,7 @@ async def test_padded_participant_name_still_loads(monkeypatch, patched_save):
     _patch_crm(monkeypatch, summary=_summary(_HEALTHY), rows=_rows())
     trimmed = dispatcher._with_trimmed_participants(_key(f" {_EAN_A}  "))
 
-    result = await dispatcher._load_from_crm(_snapshot(), consumer_names_of(trimmed))
+    result = await dispatcher._load_from_crm(_snapshot(), consumer_names_of(trimmed), iterations=1)
 
     assert not isinstance(result, dispatcher._Terminal)
     assert result.consumer_names == [_EAN_A]
@@ -202,7 +203,7 @@ async def test_crm_read_failure_is_transient(monkeypatch, patched_save):
     _patch_crm(monkeypatch, summary=None, raises=OSError("connection reset"))
 
     with pytest.raises(dispatcher._TransientError, match="crm read"):
-        await dispatcher._load_from_crm(_snapshot(), [_EAN_A])
+        await dispatcher._load_from_crm(_snapshot(), [_EAN_A], iterations=1)
 
     patched_save.assert_not_awaited()
 
@@ -215,7 +216,7 @@ async def test_crm_read_failure_is_transient(monkeypatch, patched_save):
 async def test_unmatched_participant_fails_deterministically(monkeypatch, patched_save):
     repository = _patch_crm(monkeypatch, summary=_summary(_HEALTHY))
 
-    result = await dispatcher._load_from_crm(_snapshot(), ["C0"])
+    result = await dispatcher._load_from_crm(_snapshot(), ["C0"], iterations=1)
 
     assert isinstance(result, dispatcher._Terminal)
     assert result.storage_key is None
@@ -225,10 +226,23 @@ async def test_unmatched_participant_fails_deterministically(monkeypatch, patche
     repository.fetch_rows.assert_not_awaited()
 
 
+async def test_run_too_large_fails_before_the_readings_are_fetched(monkeypatch, patched_save):
+    # 1 participant x 4 instants x 3 iterations = 12 cells, one over the limit.
+    monkeypatch.setattr(problem_size, "MAX_SIMULATION_CELLS", 11)
+    repository = _patch_crm(monkeypatch, summary=_summary(_HEALTHY), rows=_rows())
+
+    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A], iterations=3)
+
+    assert isinstance(result, dispatcher._Terminal)
+    detail = patched_save.await_args.args[1]
+    assert detail.startswith("crm_data_rejected: 1 participants x 4 timesteps x 3 iterations")
+    repository.fetch_rows.assert_not_awaited()
+
+
 async def test_empty_period_fails_deterministically(monkeypatch, patched_save):
     _patch_crm(monkeypatch, summary=_summary([]))
 
-    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A])
+    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A], iterations=1)
 
     assert isinstance(result, dispatcher._Terminal)
     assert "crm_data_rejected" in patched_save.await_args.args[1]
@@ -245,7 +259,7 @@ async def test_duplicate_readings_fail_deterministically(monkeypatch, patched_sa
         ),
     )
 
-    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A])
+    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A], iterations=1)
 
     assert isinstance(result, dispatcher._Terminal)
     assert "imported twice" in patched_save.await_args.args[1]
@@ -254,7 +268,7 @@ async def test_duplicate_readings_fail_deterministically(monkeypatch, patched_sa
 async def test_no_injection_fails_deterministically(monkeypatch, patched_save):
     _patch_crm(monkeypatch, summary=_summary([_coverage(_EAN_A, consumption=40.0, injection=0.0)]))
 
-    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A])
+    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A], iterations=1)
 
     assert isinstance(result, dispatcher._Terminal)
     assert "nothing to share" in patched_save.await_args.args[1]
@@ -263,7 +277,9 @@ async def test_no_injection_fails_deterministically(monkeypatch, patched_save):
 async def test_incomplete_crm_columns_fail_deterministically(monkeypatch, patched_save):
     _patch_crm(monkeypatch, summary=_summary([]))
 
-    result = await dispatcher._load_from_crm(_snapshot(id_sharing_operation=None), [_EAN_A])
+    result = await dispatcher._load_from_crm(
+        _snapshot(id_sharing_operation=None), [_EAN_A], iterations=1
+    )
 
     assert isinstance(result, dispatcher._Terminal)
     patched_save.assert_awaited_once_with(1, "crm_source_incomplete")
@@ -289,8 +305,22 @@ async def test_gaps_do_not_stop_the_run_and_are_zero_filled(monkeypatch, patched
         rows=rows,
     )
 
-    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A])
+    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A], iterations=1)
 
     assert not isinstance(result, dispatcher._Terminal)
     assert result.C.tolist() == [[10.0, 10.0, 0.0, 0.0]]
     patched_save.assert_not_awaited()
+
+
+async def test_a_non_finite_reading_fails_deterministically(monkeypatch, patched_save):
+    rows = _rows()
+    rows[2] = ConsumptionRow(
+        timestamp=rows[2].timestamp, ean=_EAN_A, gross=float("inf"), inj_gross=0.0
+    )
+    _patch_crm(monkeypatch, summary=_summary(_HEALTHY), rows=rows)
+
+    result = await dispatcher._load_from_crm(_snapshot(), [_EAN_A], iterations=1)
+
+    assert isinstance(result, dispatcher._Terminal)
+    patched_save.assert_awaited_once()
+    assert patched_save.await_args.args[1].startswith(f"crm_pivot_failed: column '{_EAN_A}'")

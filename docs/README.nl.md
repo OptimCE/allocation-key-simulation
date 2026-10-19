@@ -55,7 +55,10 @@ Een uitvoering doorloopt het systeem als volgt:
    `PENDING`-uitvoering en publiceert een `optimce.simulation.run`-gebeurtenis.
 3. De worker neemt de taak op, koppelt de kolommen van het bestand aan de
    verbruikers van de sleutel op naam, en voert de solver
-   (`simulation/compute.py`, een pure functie) uit buiten de event-loop.
+   (`simulation/compute.py`, een pure functie) uit buiten de event-loop. Elke
+   cel van die kolommen en van de injectiekolom moet een getal bevatten: een lege
+   cel laat de uitvoering mislukken (`parse_failed`, met de kolom en de eerste
+   betrokken gegevensrij).
 4. De scalaire totalen worden naar de lokale database geschreven; de reeks per
    tijdstap wordt als JSON-object geüpload. De uitvoering wordt gemarkeerd als
    `SUCCESS` (of `FAILED`).
@@ -83,7 +86,7 @@ Alle eindpunten vereisen authenticatie en een actief gemeenschapsabonnement (zie
 |---|---|---|
 | `GET` | `/` | Simulaties (gepagineerd) met hun status opsommen |
 | `GET` | `/{id}` | Eén simulatie met haar scalaire resultaatboom ophalen |
-| `GET` | `/{id}/timeseries` | De resultaatreeks per tijdstap voor grafieken ophalen |
+| `GET` | `/{id}/timeseries` | De resultaatreeks per tijdstap ophalen; `?max_points=N` voor een grafiek (de eigen reeksen van elke iteratie, bemonsterd) |
 | `POST` | `/` | Een simulatie starten (`multipart/form-data`: `file`, `name`, `id_key`, `injection_name`) |
 | `DELETE` | `/{id}` | Een simulatie en de opgeslagen resultaten verwijderen |
 
@@ -165,6 +168,64 @@ variabele. De belangrijkste groepen zijn:
 - **Observability** (`LOGGING_TOKEN`, `LOGGING_TRACES_URL`, `LOGGING_LOGS_URL`,
   `LOGGING_METRICS_URL`)
 - **Omgevingskeuze** (`ENV`: `local`, `test`, `staging`, `production`)
+
+## Dimensionering van middelen
+
+De worker rekent in een pool van processen, één per toegewezen CPU min één (de
+compose-bestanden geven hem 2 CPU's, dus één rekenproces). Wat een simulatie
+kost, groeit met haar aantal **cellen**: deelnemers × tijdstappen × iteraties.
+Haar resultaat bevat vijf waarden per cel; een kwartierreeks telt 96 tijdstappen
+per dag.
+
+Gemeten in de worker-image met 2 CPU's, op de grens hieronder:
+
+| Invoer | Cellen | Hoofdproces | Rekenproces | Container¹ |
+|---|---|---|---|---|
+| CRM, 142 meters × een jaar, 1 iteratie | 4.975.680 | 1,25 GB | 1,46 GB | 1,92 GB |
+| CRM, dezelfde periode, 47 van de meters, 3 iteraties | 4.940.640 | 1,25 GB | 1,23 GB | 1,85 GB |
+| CSV van 50 MB (240 meters × een jaar), 142 ervan, 1 iteratie | 4.975.680 | 0,40 GB | 1,46 GB | 1,70 GB |
+| hetzelfde bestand, 47 van de meters, 3 iteraties | 4.940.640 | 0,36 GB | 1,23 GB | 1,69 GB |
+
+¹ Inclusief de paginacache van het resultaatbestand, 350 tot 400 MB, die de
+kernel kan terugwinnen. Elke run duurde minder dan 70 seconden.
+
+- **Grens.** Een simulatie van meer dan **5.000.000** cellen wordt geweigerd met
+  fout 2119: door de CRM-voorvertoning en `POST /from-crm` (bij de andere
+  blokkades, voordat er meetwaarden worden gelezen), door `POST /` voor een
+  geüpload bestand (geteld aan de hand van zijn rijen), en opnieuw door de worker
+  op de ingelezen gegevens. Dat is 142 meters over een jaar met één iteratie, of
+  47 meters met drie. De waarde staat in `shared/problem_size.py`; verhoog ze
+  alleen samen met het geheugen van de worker. Het lezen uit het CRM zelf blijft
+  begrensd op 5.000.000 meetwaarden (fout 2116).
+- **Waar het geheugen naartoe gaat.** Het hoofdproces van de worker houdt de
+  invoer vast: het lezen uit het CRM en de pivot daarvan, tot 1,25 GB bij
+  5.000.000 meetwaarden, of het ingelezen bestand. Het rekenproces houdt het
+  resultaat vast. Het schrijft de tijdreeksen naar een tijdelijk JSON-bestand en
+  geeft alleen de totalen terug, en het hoofdproces streamt dat bestand naar de
+  objectopslag: het resultaat gaat er nooit doorheen.
+- **Containergeheugen.** De compose-bestanden van de monorepo en de productie
+  zetten `mem_limit: 2560m`, met swap op dezelfde waarde begrensd. Elk
+  rekenproces maakt zichzelf de eerste keuze van de kernel wanneer de container
+  geen geheugen meer heeft (`oom_score_adj` 1000): de berekening mislukt en wordt
+  opnieuw geprobeerd, terwijl een gestopt hoofdproces de hele worker zou
+  neerhalen en zijn bericht zonder limiet op de leveringen zou terugkomen. De
+  dimensionering gaat ervan uit dat `max_ack_pending` van de consumer gelijk is
+  aan het aantal rekenprocessen, zoals de worker het instelt, zodat er naast een
+  berekening geen tweede invoer wordt gelezen.
+- **Crashes van de berekening.** Een rekenproces dat wegens geheugengebrek wordt
+  gestopt (of crasht) breekt de hele pool. Elke simulatie die het berekende,
+  wordt opnieuw geleverd; een crash bij haar derde levering of later markeert ze
+  als mislukt met `solver_crashed (likely out of memory)`.
+- **Een resultaat teruglezen.** `GET /{id}/timeseries` stuurt het opgeslagen
+  object door zonder het in te lezen, met ongeveer 20 MB API-geheugen ongeacht de
+  grootte, en weigert een object boven 64 MiB (ongeveer 750.000 cellen) met fout
+  2120: de gateway decodeert een JSON-antwoord in zijn geheel, met ongeveer 10
+  bytes van zijn geheugen per byte. Een grafiek vraagt in plaats daarvan
+  `?max_points=N`: de eigen reeksen van elke iteratie, elke `stride`-de tijdstap
+  (vermeld in het antwoord), zonder de reeksen per verbruiker. Op de grens leest
+  dat het object van 430 MB in minder dan een seconde en antwoordt het enkele
+  honderden kB. Het object inlezen en opnieuw serialiseren, zoals de API vroeger
+  deed, kostte ongeveer 470 bytes API-geheugen per cel: 2,4 GB op de grens.
 
 ## Testen
 

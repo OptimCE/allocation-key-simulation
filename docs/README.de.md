@@ -58,6 +58,9 @@ Ein Lauf durchläuft das System wie folgt:
 3. Der Worker übernimmt den Auftrag, ordnet die Spalten der Datei den
    Verbrauchern des Schlüssels über den Namen zu und führt den Solver
    (`simulation/compute.py`, eine reine Funktion) außerhalb der Event-Loop aus.
+   Jede Zelle dieser Spalten und der Einspeisungsspalte muss eine Zahl enthalten:
+   eine leere Zelle lässt den Lauf scheitern (`parse_failed`, mit der Spalte und
+   ihrer ersten betroffenen Datenzeile).
 4. Die skalaren Summen werden in die lokale Datenbank geschrieben; die Zeitreihe
    pro Zeitschritt wird als JSON-Objekt hochgeladen. Der Lauf wird als `SUCCESS`
    (oder `FAILED`) markiert.
@@ -86,7 +89,7 @@ sind daher relativ:
 |---|---|---|
 | `GET` | `/` | Simulationen (paginiert) mit ihrem Status auflisten |
 | `GET` | `/{id}` | Eine Simulation mit ihrem skalaren Ergebnisbaum abrufen |
-| `GET` | `/{id}/timeseries` | Die Ergebnis-Zeitreihe pro Zeitschritt für Diagramme abrufen |
+| `GET` | `/{id}/timeseries` | Die Ergebnis-Zeitreihe pro Zeitschritt abrufen; `?max_points=N` für ein Diagramm (die eigenen Reihen jeder Iteration, ausgedünnt) |
 | `POST` | `/` | Eine Simulation starten (`multipart/form-data`: `file`, `name`, `id_key`, `injection_name`) |
 | `DELETE` | `/{id}` | Eine Simulation und ihre gespeicherten Ergebnisse löschen |
 
@@ -168,6 +171,66 @@ Variable. Die wichtigsten Gruppen sind:
 - **Observability** (`LOGGING_TOKEN`, `LOGGING_TRACES_URL`, `LOGGING_LOGS_URL`,
   `LOGGING_METRICS_URL`)
 - **Umgebungsauswahl** (`ENV`: `local`, `test`, `staging`, `production`)
+
+## Ressourcenbemessung
+
+Der Worker rechnet in einem Prozesspool, einem Prozess pro zugewiesener CPU minus
+eins (die Compose-Dateien geben ihm 2 CPUs, also einen Rechenprozess). Was eine
+Simulation kostet, wächst mit ihren **Zellen**: Teilnehmer × Zeitschritte ×
+Iterationen. Ihr Ergebnis enthält fünf Werte pro Zelle; eine Viertelstundenreihe
+hat 96 Zeitschritte pro Tag.
+
+Gemessen im Worker-Image mit 2 CPUs, an der unten genannten Grenze:
+
+| Eingabe | Zellen | Hauptprozess | Rechenprozess | Container¹ |
+|---|---|---|---|---|
+| CRM, 142 Zähler × ein Jahr, 1 Iteration | 4.975.680 | 1,25 GB | 1,46 GB | 1,92 GB |
+| CRM, derselbe Zeitraum, 47 der Zähler, 3 Iterationen | 4.940.640 | 1,25 GB | 1,23 GB | 1,85 GB |
+| 50-MB-CSV (240 Zähler × ein Jahr), 142 davon, 1 Iteration | 4.975.680 | 0,40 GB | 1,46 GB | 1,70 GB |
+| dieselbe Datei, 47 der Zähler, 3 Iterationen | 4.940.640 | 0,36 GB | 1,23 GB | 1,69 GB |
+
+¹ Einschließlich des Seitencaches der Ergebnisdatei, 350 bis 400 MB, den der
+Kernel zurückholen kann. Jeder Lauf dauerte weniger als 70 Sekunden.
+
+- **Grenze.** Eine Simulation mit mehr als **5.000.000** Zellen wird mit Fehler
+  2119 abgelehnt: von der CRM-Vorschau und `POST /from-crm` (bei den anderen
+  Blockern, bevor Messwerte gelesen werden), von `POST /` für eine hochgeladene
+  Datei (anhand ihrer Zeilen gezählt) und erneut vom Worker auf den geparsten
+  Daten. Das sind 142 Zähler über ein Jahr mit einer Iteration oder 47 Zähler
+  mit drei. Der Wert steht in `shared/problem_size.py`; erhöhen Sie ihn nur
+  zusammen mit dem Speicher des Workers. Das CRM-Lesen selbst bleibt auf
+  5.000.000 Messwerte begrenzt (Fehler 2116).
+- **Wohin der Speicher geht.** Der Hauptprozess des Workers hält die Eingabe:
+  das CRM-Lesen und seinen Pivot, bis zu 1,25 GB bei 5.000.000 Messwerten, oder
+  die geparste Datei. Der Rechenprozess hält das Ergebnis. Er schreibt die
+  Zeitreihen in eine temporäre JSON-Datei und gibt nur die Summen zurück, und der
+  Hauptprozess streamt diese Datei in den Objektspeicher: Das Ergebnis geht nie
+  durch ihn hindurch.
+- **Containerspeicher.** Die Compose-Dateien des Monorepos und der Produktion
+  setzen `mem_limit: 2560m`, mit Swap auf denselben Wert begrenzt. Jeder
+  Rechenprozess macht sich zur ersten Wahl des Kernels, wenn dem Container der
+  Speicher ausgeht (`oom_score_adj` 1000): Die Berechnung scheitert und wird
+  wiederholt, während ein beendeter Hauptprozess den ganzen Worker stoppen würde
+  und seine Nachricht ohne Begrenzung der Zustellungen zurückkäme. Die Bemessung
+  setzt voraus, dass `max_ack_pending` des Consumers der Zahl der Rechenprozesse
+  entspricht, wie der Worker es einstellt, damit neben einer Berechnung keine
+  zweite Eingabe gelesen wird.
+- **Abstürze der Berechnung.** Ein wegen Speichermangels beendeter (oder
+  abgestürzter) Rechenprozess bricht den ganzen Pool. Jede Simulation, die er
+  berechnete, wird erneut zugestellt; ein Absturz bei ihrer dritten Zustellung
+  oder später markiert sie als fehlgeschlagen mit `solver_crashed (likely out of
+  memory)`.
+- **Ein Ergebnis zurücklesen.** `GET /{id}/timeseries` leitet das gespeicherte
+  Objekt weiter, ohne es zu parsen, mit etwa 20 MB API-Speicher unabhängig von
+  seiner Größe, und lehnt ein Objekt über 64 MiB (etwa 750.000 Zellen) mit
+  Fehler 2120 ab: das Gateway dekodiert eine JSON-Antwort vollständig, mit etwa
+  10 Byte seines Speichers pro Byte. Ein Diagramm fragt stattdessen
+  `?max_points=N` an: die eigenen Reihen jeder Iteration, jeden `stride`-ten
+  Zeitschritt (in der Antwort angegeben), ohne die Reihen pro Verbraucher. An der
+  Grenze liest das das 430-MB-Objekt in unter einer Sekunde und antwortet mit
+  einigen hundert kB. Das Objekt zu parsen und neu zu serialisieren, wie es die
+  API früher tat, brauchte etwa 470 Byte API-Speicher pro Zelle: 2,4 GB an der
+  Grenze.
 
 ## Tests
 

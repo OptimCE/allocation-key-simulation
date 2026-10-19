@@ -28,7 +28,9 @@
       "CRM_NO_INJECTION": "Aucune injection sur cette période : il n'y a rien à partager (code: 2115)",
       "CRM_RANGE_TOO_LARGE": "La période sélectionnée contient trop de relevés, veuillez la raccourcir (code: 2116)",
       "KEY_CONSUMERS_NOT_MATCHED": "Certains participants de la clé ne correspondent à aucun compteur (EAN) sur cette période (code: 2117)",
-      "GET_CRM_PREVIEW": "Impossible de vérifier les données de comptage (code: 2118)"
+      "GET_CRM_PREVIEW": "Impossible de vérifier les données de comptage (code: 2118)",
+      "SIMULATION_TOO_LARGE": "Trop de données pour une seule simulation (participants × pas de temps × itérations), veuillez raccourcir la période ou simuler une clé avec moins de participants ou d'itérations (code: 2119)",
+      "TIMESERIES_TOO_LARGE": "Les séries temporelles de cette simulation sont trop volumineuses pour être envoyées en entier (code: 2120)"
     }
   }
 }

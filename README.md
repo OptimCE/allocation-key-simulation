@@ -52,7 +52,9 @@ A run flows through the system like this:
    publishes a `optimce.simulation.run` event.
 3. The worker claims the job, matches the file's columns to the key's consumers
    by name, and runs the solver (`simulation/compute.py`, a pure function) off
-   the event loop.
+   the event loop. Every cell of those columns and of the injection column must
+   hold a number: an empty one fails the run (`parse_failed`, naming the column
+   and its first such data row).
 4. Scalar totals are written to the local database; the per-timestep series is
    uploaded as a JSON object. The run is marked `SUCCESS` (or `FAILED`).
 
@@ -79,7 +81,7 @@ All endpoints require authentication and an active community subscription (see
 |---|---|---|
 | `GET` | `/` | List simulations (paginated) with their status |
 | `GET` | `/{id}` | Get one simulation with its scalar result tree |
-| `GET` | `/{id}/timeseries` | Get the per-timestep result series for charting |
+| `GET` | `/{id}/timeseries` | Get the per-timestep result series; `?max_points=N` for a chart (each iteration's own series, sampled) |
 | `POST` | `/` | Start a simulation (`multipart/form-data`: `file`, `name`, `id_key`, `injection_name`) |
 | `DELETE` | `/{id}` | Delete a simulation and its stored results |
 
@@ -159,6 +161,59 @@ variable. The main groups are:
 - **Observability** (`LOGGING_TOKEN`, `LOGGING_TRACES_URL`, `LOGGING_LOGS_URL`,
   `LOGGING_METRICS_URL`)
 - **Environment selector** (`ENV`: `local`, `test`, `staging`, `production`)
+
+## Resource sizing
+
+The worker solves in a pool of processes, one per CPU it is given minus one (the
+compose files give it 2 CPUs, hence one solver process). What a simulation costs
+grows with its **cells**: participants × timesteps × iterations. Its result holds
+five values per cell; a quarter-hour series has 96 timesteps a day.
+
+Measured in the worker image with 2 CPUs, at the limit below:
+
+| Input | Cells | Main process | Solver process | Container¹ |
+|---|---|---|---|---|
+| CRM, 142 meters × a year, 1 iteration | 4,975,680 | 1.25 GB | 1.46 GB | 1.92 GB |
+| CRM, the same period, 47 of the meters, 3 iterations | 4,940,640 | 1.25 GB | 1.23 GB | 1.85 GB |
+| 50 MB CSV (240 meters × a year), 142 of them, 1 iteration | 4,975,680 | 0.40 GB | 1.46 GB | 1.70 GB |
+| the same file, 47 of the meters, 3 iterations | 4,940,640 | 0.36 GB | 1.23 GB | 1.69 GB |
+
+¹ Including the page cache of the result file, 350 to 400 MB, which the kernel
+can reclaim. Each run took under 70 seconds.
+
+- **Limit.** A simulation over **5,000,000** cells is refused with error 2119:
+  by the CRM preview and `POST /from-crm` (listed with the other blockers,
+  before any reading is fetched), by `POST /` for an uploaded file (counted from
+  its rows), and again by the worker on the parsed data. That is 142 meters over
+  a year with one iteration, or 47 meters with three. The value lives in
+  `shared/problem_size.py`; raise it only together with the worker's memory. The
+  CRM read itself stays capped at 5,000,000 readings (error 2116).
+- **Where the memory goes.** The worker's main process holds the input: the CRM
+  read and its pivot, up to 1.25 GB at 5,000,000 readings, or the parsed upload.
+  The solver process holds the result. It writes the per-timestep series to a
+  temporary JSON file and hands back only the totals, and the main process
+  streams that file to object storage, so the result never passes through it.
+- **Container memory.** The monorepo and production compose files set
+  `mem_limit: 2560m`, with swap capped at the same value. Each solver process
+  makes itself the kernel's first choice when the container runs out of memory
+  (`oom_score_adj` 1000): the solve fails and is retried, while a killed main
+  process would take the whole worker down and its message would come back with
+  no limit on the deliveries. The sizing assumes the consumer's
+  `max_ack_pending` equals the number of solver processes, as the worker sets
+  it, so that no second input is read beside a solve.
+- **Solver crashes.** A solver process killed for memory (or crashing) breaks
+  the whole pool. Each simulation it was solving is delivered again; a crash on
+  its third delivery or later marks it failed with `solver_crashed (likely out
+  of memory)`.
+- **Reading a result back.** `GET /{id}/timeseries` streams the stored object
+  without parsing it, in about 20 MB of API memory whatever its size, and
+  refuses one over 64 MiB (about 750,000 cells) with error 2120: the gateway
+  decodes a JSON response whole, at about 10 bytes of its memory per byte. A
+  chart asks for `?max_points=N` instead: each iteration's own series, every
+  `stride`-th timestep (given in the response), without the per-consumer
+  series. At the limit that reads the 430 MB object in under a second and
+  answers a few hundred kB. Parsing and re-serialising the object, as the API
+  used to, took about 470 bytes of API memory per cell: 2.4 GB at the limit.
 
 ## Testing
 

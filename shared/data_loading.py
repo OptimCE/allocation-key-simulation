@@ -32,6 +32,15 @@ class ConsumerColumnsError(ValueError):
     """Raised when the file columns don't match the key's consumer names."""
 
 
+class NonFiniteValueError(ValueError):
+    """Raised when a consumer or injection cell is empty or not a finite number.
+
+    pandas reads an empty cell as NaN (and "inf" as infinity). One of them made
+    every total of the run NaN, a result the API could not send: JSON has no
+    NaN.
+    """
+
+
 @dataclass(frozen=True)
 class SimulationRawData:
     """Pre-parsed input data passed to ``simulation.compute.run_simulation``.
@@ -86,12 +95,28 @@ def to_simulation_raw_data(
     consumption = dataframe[list(consumer_names)].to_numpy(dtype=np.float64).transpose()
     production_series = dataframe[injection_name].to_numpy(dtype=np.float64)
 
+    _require_finite(consumption, list(consumer_names))
+    _require_finite(production_series[np.newaxis, :], [injection_name])
+
     VA = np.tile(production_series, (len(consumer_names), 1))
     return SimulationRawData(
         C=consumption,
         VA=VA,
         consumer_names=[str(c) for c in consumer_names],
     )
+
+
+def _require_finite(series: np.ndarray, columns: list[str]) -> None:
+    """Refuse an empty or non-finite cell; ``series`` holds one row per column."""
+    invalid = ~np.isfinite(series)
+    if not invalid.any():
+        return
+    for column, column_invalid in zip(columns, invalid, strict=True):
+        if column_invalid.any():
+            raise NonFiniteValueError(
+                f"column {column!r} has {int(column_invalid.sum())} empty or non-numeric"
+                f" cell(s), the first in data row {int(np.argmax(column_invalid)) + 1}"
+            )
 
 
 def load(

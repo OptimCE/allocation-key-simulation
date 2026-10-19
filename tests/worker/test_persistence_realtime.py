@@ -18,7 +18,7 @@ import pytest_asyncio
 from core.realtime import Tier
 from shared.const import SimulationStatus
 from tests.factories.simulation_factory import create_simulation
-from tests.worker.test_persistence import _result
+from tests.worker.test_persistence import _SERIES_FILE, _result
 from worker import persistence
 
 
@@ -44,7 +44,7 @@ async def patched_sessions(db_session, monkeypatch):
 
     monkeypatch.setattr(persistence, "AsyncSessionLocalFactory", _Factory())
     monkeypatch.setattr(persistence, "AsyncSessionCRMFactory", _Factory())
-    monkeypatch.setattr(persistence.storage, "upload", AsyncMock())
+    monkeypatch.setattr(persistence.storage, "upload_file", AsyncMock())
     yield
 
 
@@ -71,7 +71,7 @@ async def trace(db_session, monkeypatch):
 async def test_save_success_emits_after_the_commit(db_session, patched_sessions, trace):
     sim = await create_simulation(db_session, id_community=7)
 
-    await persistence.save_success(sim.id, _result())
+    await persistence.save_success(sim.id, _result(), _SERIES_FILE)
 
     assert "emit" in trace, "no realtime hint was published for a successful simulation"
     # THE assertion. Not "did it emit" but "did it emit after the write landed".
@@ -83,7 +83,7 @@ async def test_save_success_addresses_the_community_manager_tier(
 ):
     sim = await create_simulation(db_session, id_community=7)
 
-    await persistence.save_success(sim.id, _result())
+    await persistence.save_success(sim.id, _result(), _SERIES_FILE)
 
     payload = trace[trace.index("emit") + 1]
     assert payload["topic"] == "simulation.finished"
@@ -117,7 +117,7 @@ async def test_no_emit_when_the_row_is_already_terminal(db_session, patched_sess
     # returns early, so a second delivery must not re-toast every open hub.
     sim = await create_simulation(db_session, id_community=7, status=SimulationStatus.SUCCESS)
 
-    await persistence.save_success(sim.id, _result())
+    await persistence.save_success(sim.id, _result(), _SERIES_FILE)
 
     assert "emit" not in trace
 
@@ -125,12 +125,12 @@ async def test_no_emit_when_the_row_is_already_terminal(db_session, patched_sess
 async def test_double_delivery_emits_exactly_once(db_session, patched_sessions, trace):
     sim = await create_simulation(db_session, id_community=7)
 
-    await persistence.save_success(sim.id, _result())
-    await persistence.save_success(sim.id, _result())
+    await persistence.save_success(sim.id, _result(), _SERIES_FILE)
+    await persistence.save_success(sim.id, _result(), _SERIES_FILE)
 
     assert trace.count("emit") == 1
 
 
 async def test_missing_row_emits_nothing(db_session, patched_sessions, trace):
-    await persistence.save_success(999_999, _result())
+    await persistence.save_success(999_999, _result(), _SERIES_FILE)
     assert "emit" not in trace
