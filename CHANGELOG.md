@@ -72,3 +72,13 @@ and this project adheres to
   as the dev one, kept a 2-minute `ack_wait` and let JetStream hand out 1000
   simulations at once. The worker now updates the durable in place when it
   starts and logs the old and new values.
+- A simulation whose deliveries keep ending without a result is no longer
+  delivered forever. A transient failure (object storage or the CRM database
+  unreachable, a failed write of the result) was retried every 30 seconds
+  without limit, and a worker that died or was restarted mid-run got the
+  simulation back every 10 minutes, also without limit. The 10th delivery now
+  marks the simulation failed with `delivery_limit_reached` without running it
+  again, so an outage longer than about four and a half minutes fails the
+  simulations waiting on it. As a backstop, the `worker-simulation` consumer now
+  has `max_deliver` 11 instead of unlimited, set in place on the existing
+  consumer when the worker starts.

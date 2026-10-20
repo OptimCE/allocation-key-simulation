@@ -211,15 +211,25 @@ Kernel zurückholen kann. Jeder Lauf dauerte weniger als 70 Sekunden.
   Rechenprozess macht sich zur ersten Wahl des Kernels, wenn dem Container der
   Speicher ausgeht (`oom_score_adj` 1000): Die Berechnung scheitert und wird
   wiederholt, während ein beendeter Hauptprozess den ganzen Worker stoppen würde
-  und seine Nachricht ohne Begrenzung der Zustellungen zurückkäme. Die Bemessung
-  setzt voraus, dass `max_ack_pending` des Consumers der Zahl der Rechenprozesse
-  entspricht, wie der Worker es einstellt, damit neben einer Berechnung keine
-  zweite Eingabe gelesen wird.
+  und seine Nachricht alle 10 Minuten zurückkäme, bis zur unten beschriebenen
+  Zustellgrenze. Die Bemessung setzt voraus, dass `max_ack_pending` des
+  Consumers der Zahl der Rechenprozesse entspricht, wie der Worker es einstellt,
+  damit neben einer Berechnung keine zweite Eingabe gelesen wird.
 - **Abstürze der Berechnung.** Ein wegen Speichermangels beendeter (oder
   abgestürzter) Rechenprozess bricht den ganzen Pool. Jede Simulation, die er
   berechnete, wird erneut zugestellt; ein Absturz bei ihrer dritten Zustellung
   oder später markiert sie als fehlgeschlagen mit `solver_crashed (likely out of
   memory)`.
+- **Zustellgrenze.** Eine Simulation, deren Zustellungen immer wieder ohne
+  Ergebnis enden, wird bei ihrer 10. Zustellung mit `delivery_limit_reached`
+  als fehlgeschlagen markiert, ohne erneut zu laufen. Das betrifft
+  vorübergehende Fehler (Objektspeicher oder CRM-Datenbank nicht erreichbar,
+  alle 30 Sekunden wiederholt, sodass die ersten 9 Zustellungen etwa
+  viereinhalb Minuten Ausfall überbrücken) und einen Worker, der mitten im Lauf
+  gestorben ist oder neu gestartet wurde. Das `max_deliver` des Consumers ist
+  11, eine Absicherung, die der Worker beim Start auf den bestehenden Consumer
+  anwendet: JetStream stoppt eine Nachricht dort, auch wenn ihr Fehlschlag nicht
+  gespeichert werden konnte, und die Simulation bleibt dann ausstehend.
 - **Ein Ergebnis zurücklesen.** `GET /{id}/timeseries` leitet das gespeicherte
   Objekt weiter, ohne es zu parsen, mit etwa 20 MB API-Speicher unabhängig von
   seiner Größe, und lehnt ein Objekt über 64 MiB (etwa 750.000 Zellen) mit
