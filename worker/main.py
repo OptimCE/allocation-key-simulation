@@ -63,8 +63,9 @@ _INFLIGHT_DRAIN_TIMEOUT_SECONDS = 25
 # that when the container reaches its memory limit the kernel kills a solver
 # process rather than this one. A dead solver process is a BrokenProcessPool the
 # dispatcher retries a bounded number of times; a dead main process takes the
-# worker down and its message comes back after ack_wait, uncounted. Raising the
-# score needs no privilege; lowering it would.
+# worker down and its message comes back after ack_wait, a whole run lost each
+# time, until dispatcher._MAX_DELIVERIES stops it. Raising the score needs no
+# privilege; lowering it would.
 _OOM_SCORE_ADJ_PATH = pathlib.Path("/proc/self/oom_score_adj")
 _SOLVER_OOM_SCORE_ADJ = 1000
 

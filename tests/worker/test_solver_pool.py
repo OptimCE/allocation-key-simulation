@@ -411,14 +411,27 @@ def _simulations_js() -> FakeJetStream:
     return FakeJetStream({"SIMULATIONS": ["optimce.simulation.>"]})
 
 
-async def test_subscribe_sets_ack_wait_and_max_ack_pending():
+async def test_subscribe_sets_ack_wait_max_deliver_and_max_ack_pending():
     js = _simulations_js()
 
     await dispatcher.subscribe(js, max_ack_pending=3)
 
     config = js.stored(SIMULATION_SUBJECT, dispatcher._DURABLE)
     assert config.ack_wait == dispatcher._ACK_WAIT_SECONDS
+    assert config.max_deliver == dispatcher._MAX_DELIVER
     assert config.max_ack_pending == 3
+
+
+async def test_subscribe_caps_the_deliveries_of_a_durable_an_earlier_build_created():
+    """The deployed durable has max_deliver -1 (unlimited), the broker's
+    default: the backstop has to reach it in place."""
+    js = _simulations_js()
+    js.seed(SIMULATION_SUBJECT, dispatcher._DURABLE, ack_wait=float(dispatcher._ACK_WAIT_SECONDS))
+    assert js.stored(SIMULATION_SUBJECT, dispatcher._DURABLE).max_deliver == -1
+
+    await dispatcher.subscribe(js, max_ack_pending=1)
+
+    assert js.stored(SIMULATION_SUBJECT, dispatcher._DURABLE).max_deliver == dispatcher._MAX_DELIVER
 
 
 async def test_subscribe_updates_a_durable_an_earlier_build_created():

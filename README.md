@@ -197,14 +197,23 @@ can reclaim. Each run took under 70 seconds.
   `mem_limit: 2560m`, with swap capped at the same value. Each solver process
   makes itself the kernel's first choice when the container runs out of memory
   (`oom_score_adj` 1000): the solve fails and is retried, while a killed main
-  process would take the whole worker down and its message would come back with
-  no limit on the deliveries. The sizing assumes the consumer's
-  `max_ack_pending` equals the number of solver processes, as the worker sets
-  it, so that no second input is read beside a solve.
+  process would take the whole worker down and its message would come back
+  every 10 minutes until the delivery limit below. The sizing assumes the
+  consumer's `max_ack_pending` equals the number of solver processes, as the
+  worker sets it, so that no second input is read beside a solve.
 - **Solver crashes.** A solver process killed for memory (or crashing) breaks
   the whole pool. Each simulation it was solving is delivered again; a crash on
   its third delivery or later marks it failed with `solver_crashed (likely out
   of memory)`.
+- **Delivery limit.** A simulation whose deliveries keep ending without a
+  result is marked failed with `delivery_limit_reached` on its 10th delivery,
+  without being run again. That covers transient failures (object storage or
+  the CRM database unreachable, retried every 30 seconds, so the first 9
+  deliveries ride out about four and a half minutes of outage) and a worker that
+  died or was restarted mid-run. The consumer's `max_deliver` is 11, a backstop
+  the worker applies to the existing consumer when it starts: JetStream stops a
+  message there even if its failure could not be recorded, and its simulation
+  then stays pending.
 - **Reading a result back.** `GET /{id}/timeseries` streams the stored object
   without parsing it, in about 20 MB of API memory whatever its size, and
   refuses one over 64 MiB (about 750,000 cells) with error 2120: the gateway

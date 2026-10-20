@@ -20,6 +20,14 @@ Message handling follows a strict failure-class matrix:
   it see it too and are retried as well. A crash that is deterministic (input
   too large for the container) repeats on every delivery and must not loop
   forever.
+* **Deliveries that end without a result** (a NAK above, or a worker that
+  died, lost NATS or was shut down mid-run, whose message comes back after
+  ack_wait) — JetStream counts them. From delivery ``_MAX_DELIVERIES`` on,
+  the simulation is marked FAILED (``delivery_limit_reached``) and acked
+  without running anything, so that whatever ended the earlier deliveries
+  cannot repeat forever. The consumer's ``max_deliver`` (``_MAX_DELIVER``)
+  stops the broker one delivery later, in case even that could not be
+  recorded.
 
 Long runs
 ---------
@@ -38,15 +46,16 @@ Memory
 ------
 This process must not be the one that runs out of memory: its death takes the
 whole worker down, the in-progress acks stop, and the message comes back after
-ack_wait with nothing counting how often (``_MAX_SOLVER_CRASH_DELIVERIES``
-counts only solver crashes). So the run's size is checked before the solve
-(``shared.problem_size``), and its result, whose per-timestep series dominate,
-never comes back here whole: the solver process writes the series to a JSON
-file (``worker.timeseries``), returns the totals, and ``persistence`` streams
-the file to storage. What grows here is the input: the CRM read (bounded by
-``crm_preflight.MAX_READING_ROWS``) or the parsed upload (bounded by the upload
-size limit). The solver processes volunteer as the kernel's first victim when
-the container runs out (``worker.main._init_solver_process``).
+ack_wait, a whole run lost each time, until ``_MAX_DELIVERIES`` stops it
+(``_MAX_SOLVER_CRASH_DELIVERIES`` counts only solver crashes). So the run's
+size is checked before the solve (``shared.problem_size``), and its result,
+whose per-timestep series dominate, never comes back here whole: the solver
+process writes the series to a JSON file (``worker.timeseries``), returns the
+totals, and ``persistence`` streams the file to storage. What grows here is the
+input: the CRM read (bounded by ``crm_preflight.MAX_READING_ROWS``) or the
+parsed upload (bounded by the upload size limit). The solver processes
+volunteer as the kernel's first victim when the container runs out
+(``worker.main._init_solver_process``).
 
 File-storage cleanup runs only on terminal outcomes (SUCCESS, deterministic
 FAILURE), never on transient NAKs (the next delivery still needs the file).
@@ -114,6 +123,21 @@ _NAK_RETRY_DELAY_SECONDS = 30
 # may have come from another simulation sharing the pool, or from memory
 # pressure that has since passed.
 _MAX_SOLVER_CRASH_DELIVERIES = 3
+
+# The delivery on which a simulation is no longer processed: it is marked
+# FAILED and acked at once. Nothing else bounds a message whose deliveries keep
+# ending without a result: a NAK for a transient failure, or a worker that died
+# (its main process killed, say), lost NATS or was shut down mid-run, so that
+# the message came back after ack_wait. _MAX_SOLVER_CRASH_DELIVERIES covers
+# solver crashes only. The 9 deliveries before it ride out about four and a
+# half minutes of a storage or CRM outage (_NAK_RETRY_DELAY_SECONDS apart).
+_MAX_DELIVERIES = 10
+
+# The consumer's max_deliver, a backstop for the check above: one delivery
+# more, in case the last one could not record the failure (the database was
+# down as well). The broker never delivers a message again once it reaches
+# this, and its simulation then stays PENDING.
+_MAX_DELIVER = _MAX_DELIVERIES + 1
 
 _DURABLE = "worker-simulation"
 
@@ -193,10 +217,14 @@ async def subscribe(
     ``max_ack_pending`` caps how many messages JetStream delivers before we ack,
     so the broker never hands us more than the pool can actively solve.
 
-    ``subscribe_durable`` writes ``ack_wait`` and ``max_ack_pending`` onto a
-    durable an earlier build created, which ``js.subscribe`` alone does not.
+    ``max_deliver`` is always ``_MAX_DELIVER``, one more than the delivery on
+    which ``_process`` gives up (``_MAX_DELIVERIES``).
+
+    ``subscribe_durable`` writes ``ack_wait``, ``max_deliver`` and
+    ``max_ack_pending`` onto a durable an earlier build created, which
+    ``js.subscribe`` alone does not.
     """
-    config_kwargs: dict = {"ack_wait": _ACK_WAIT_SECONDS}
+    config_kwargs: dict = {"ack_wait": _ACK_WAIT_SECONDS, "max_deliver": _MAX_DELIVER}
     if max_ack_pending is not None:
         config_kwargs["max_ack_pending"] = max_ack_pending
     sub = await subscribe_durable(
@@ -413,6 +441,26 @@ async def _process(
             "Simulation %d already in status %d; acking redelivery",
             simulation_id,
             snapshot.status,
+        )
+        return _Terminal(storage_key=snapshot.file_storage_key)
+
+    # ---- Step 1b: stop a message that keeps coming back ----------------
+    # Before anything is read: reading may be what ended the earlier
+    # deliveries (the CRM unreachable, a worker killed while it loaded the
+    # input). A message without a readable count is processed; the broker's
+    # max_deliver still bounds it.
+    delivered = _delivery_count(msg)
+    if delivered is not None and delivered >= _MAX_DELIVERIES:
+        logger.error(
+            "Simulation %d is on delivery %d; the earlier ones ended without a result. "
+            "Not processing it again",
+            simulation_id,
+            delivered,
+        )
+        await persistence.save_failure(
+            simulation_id,
+            f"delivery_limit_reached: delivery {delivered}, the earlier ones ended without "
+            "a result (transient failures, or the worker stopped mid-run)",
         )
         return _Terminal(storage_key=snapshot.file_storage_key)
 
