@@ -211,13 +211,23 @@ noyau peut récupérer. Chaque exécution a pris moins de 70 secondes.
   processus de calcul se désigne comme premier choix du noyau quand le conteneur
   manque de mémoire (`oom_score_adj` 1000) : le calcul échoue et est retenté,
   alors qu'un processus principal tué arrêterait tout le worker et son message
-  reviendrait sans limite de livraisons. Ce dimensionnement suppose que le
-  `max_ack_pending` du consommateur vaut le nombre de processus de calcul, comme
-  le worker le règle, afin qu'aucune autre entrée ne soit lue pendant un calcul.
+  reviendrait toutes les 10 minutes jusqu'à la limite de livraisons ci-dessous.
+  Ce dimensionnement suppose que le `max_ack_pending` du consommateur vaut le
+  nombre de processus de calcul, comme le worker le règle, afin qu'aucune autre
+  entrée ne soit lue pendant un calcul.
 - **Plantages du calcul.** Un processus de calcul tué faute de mémoire (ou qui
   plante) casse tout le pool. Chaque simulation en cours de calcul est livrée à
   nouveau ; un plantage à sa troisième livraison ou au-delà la marque en échec
   avec `solver_crashed (likely out of memory)`.
+- **Limite de livraisons.** Une simulation dont les livraisons finissent sans
+  résultat est marquée en échec avec `delivery_limit_reached` à sa
+  10e livraison, sans être exécutée à nouveau. Cela couvre les échecs
+  transitoires (stockage objet ou base CRM injoignable, retentés toutes les
+  30 secondes : les 9 premières livraisons tiennent donc environ quatre minutes
+  et demie de panne) et un worker mort ou redémarré en pleine exécution. Le
+  `max_deliver` du consommateur vaut 11, un garde-fou que le worker applique au
+  consommateur existant à son démarrage : JetStream y arrête un message même si
+  son échec n'a pas pu être enregistré, et la simulation reste alors en attente.
 - **Relire un résultat.** `GET /{id}/timeseries` transmet l'objet stocké sans
   l'analyser, avec environ 20 Mo de mémoire de l'API quelle que soit sa taille,
   et refuse un objet de plus de 64 Mio (environ 750 000 cellules) avec l'erreur

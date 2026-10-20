@@ -208,14 +208,25 @@ kernel kan terugwinnen. Elke run duurde minder dan 70 seconden.
   rekenproces maakt zichzelf de eerste keuze van de kernel wanneer de container
   geen geheugen meer heeft (`oom_score_adj` 1000): de berekening mislukt en wordt
   opnieuw geprobeerd, terwijl een gestopt hoofdproces de hele worker zou
-  neerhalen en zijn bericht zonder limiet op de leveringen zou terugkomen. De
-  dimensionering gaat ervan uit dat `max_ack_pending` van de consumer gelijk is
-  aan het aantal rekenprocessen, zoals de worker het instelt, zodat er naast een
-  berekening geen tweede invoer wordt gelezen.
+  neerhalen en zijn bericht elke 10 minuten zou terugkomen, tot de
+  leveringslimiet hieronder. De dimensionering gaat ervan uit dat
+  `max_ack_pending` van de consumer gelijk is aan het aantal rekenprocessen,
+  zoals de worker het instelt, zodat er naast een berekening geen tweede invoer
+  wordt gelezen.
 - **Crashes van de berekening.** Een rekenproces dat wegens geheugengebrek wordt
   gestopt (of crasht) breekt de hele pool. Elke simulatie die het berekende,
   wordt opnieuw geleverd; een crash bij haar derde levering of later markeert ze
   als mislukt met `solver_crashed (likely out of memory)`.
+- **Leveringslimiet.** Een simulatie waarvan de leveringen telkens zonder
+  resultaat eindigen, wordt bij haar 10e levering als mislukt gemarkeerd met
+  `delivery_limit_reached`, zonder opnieuw te lopen. Dat dekt tijdelijke fouten
+  (objectopslag of CRM-database onbereikbaar, elke 30 seconden opnieuw
+  geprobeerd, zodat de eerste 9 leveringen ongeveer vierenhalve minuut storing
+  overbruggen) en een worker die midden in de run stierf of herstartte. De
+  `max_deliver` van de consumer is 11, een vangnet dat de worker bij het starten
+  op de bestaande consumer toepast: JetStream stopt een bericht daar, ook als de
+  mislukking niet kon worden opgeslagen, en de simulatie blijft dan in
+  afwachting.
 - **Een resultaat teruglezen.** `GET /{id}/timeseries` stuurt het opgeslagen
   object door zonder het in te lezen, met ongeveer 20 MB API-geheugen ongeacht de
   grootte, en weigert een object boven 64 MiB (ongeveer 750.000 cellen) met fout
