@@ -4,7 +4,7 @@
 
 # OptimCE — Simulation Key
 
-[![Website](https://img.shields.io/badge/Website-optimce.be-2e7d32.svg)](https://www.optimce.be)
+[![Website](https://img.shields.io/badge/Website-optimce.be-2e7d32.svg)](https://www.optimce.be/nl/)
 [![Licentie](https://img.shields.io/badge/Licentie-Apache%202.0-blue.svg)](../LICENSE)
 [![en](https://img.shields.io/badge/lang-en-lightgrey.svg)](../README.md)
 [![fr](https://img.shields.io/badge/lang-fr-lightgrey.svg)](README.fr.md)
@@ -21,7 +21,7 @@ tijdreeksen per tijdstap.
 
 OptimCE is een opensourceplatform voor het beheer van hernieuwbare-energie­
 gemeenschappen, gebouwd voor de Belgische context van energiedeling. Meer over
-het project vindt u op [www.optimce.be](https://www.optimce.be). Deze service
+het project vindt u op [www.optimce.be](https://www.optimce.be/nl/). Deze service
 draait normaal gezien als onderdeel van het volledige platform: zie de
 [ontwikkelings-monorepo](https://github.com/OptimCE/monorepo), die alle
 OptimCE-services samenbrengt en de Docker Compose-omgeving levert om ze samen uit
