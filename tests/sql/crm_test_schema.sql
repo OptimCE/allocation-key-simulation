@@ -75,6 +75,24 @@ CREATE TABLE IF NOT EXISTS app_user (
 );
 
 
+-- Mirrors crm-backend's community_user and user_member_link (same shapes as billing's
+-- mirror). Read by the data-export kit (core/export/requester.py): the requester's role in a
+-- community, and the members they represent.
+CREATE TABLE IF NOT EXISTS community_user (
+    id_community INTEGER REFERENCES community (id) ON DELETE CASCADE,
+    id_user      INTEGER REFERENCES app_user (id) ON DELETE CASCADE,
+    role         VARCHAR(50) NOT NULL,
+    PRIMARY KEY (id_community, id_user)
+);
+
+CREATE TABLE IF NOT EXISTS user_member_link (
+    id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id_user     INTEGER NOT NULL REFERENCES app_user (id),
+    id_member   INTEGER NOT NULL,
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
 -- Mirrors shared/models/crm_models.py::AuditLogModel and the production DDL
 -- in crm-backend/database_script/2026-05-27_audit_log.sql. Append-only by
 -- convention. Indexes from the production migration are omitted here — they

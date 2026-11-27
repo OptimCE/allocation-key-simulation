@@ -22,6 +22,7 @@ from core.storage.client import (
     delete,
     download,
     iter_object,
+    size,
     upload,
     upload_file,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "delete",
     "download",
     "iter_object",
+    "size",
     "upload",
     "upload_file",
 ]
