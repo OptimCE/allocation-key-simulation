@@ -192,6 +192,22 @@ async def iter_object(
                     yield chunk
 
 
+async def size(key: str) -> int | None:
+    """The size of the object at ``key``, or None when there is none (a HEAD, no body).
+
+    The data export lists a stored file by reference only when it exists: a row whose
+    object is gone is listed as missing instead of failing every export of the community.
+    Transport and 5xx errors raise ``TransientStorageError`` (the export is retried).
+    """
+    try:
+        with _read_errors(key):
+            async with _client() as s3:
+                response = await s3.head_object(Bucket=settings.STORAGE_BUCKET, Key=key)
+                return int(response.get("ContentLength", 0))
+    except ObjectNotFound:
+        return None
+
+
 async def delete(key: str) -> None:
     """Delete the object at ``key``. Idempotent and best-effort.
 
